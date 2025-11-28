@@ -48,6 +48,7 @@ struct UserInfo {
     std::vector<char> avatar;   // 头像数据
     std::string ip;             // 客户端IP地址
     uint16_t data_port;         // 点对点数据传输端口
+    int manage_port;            // 服务端专用：与客户端通信的FD（客户端忽略）
     // 最后心跳时间戳（服务端用于超时检测，客户端忽略不影响）
     std::chrono::time_point<std::chrono::system_clock> last_heartbeat;
 };
