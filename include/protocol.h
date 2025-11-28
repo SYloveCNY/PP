@@ -56,6 +56,7 @@ struct UserInfo {
 // 普通文本消息结构体
 struct CommonMsg {
     int from_user_id;       // 发送者用户ID
+    int to_user_id;         // 新增：接收者用户ID（指定收信人）
     std::string from_nickname; // 发送者昵称
     std::string content;    // 消息内容
 };

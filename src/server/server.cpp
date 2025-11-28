@@ -289,6 +289,50 @@ void heartbeat_check_thread() {
     }
 }
 
+// 处理普通消息
+void handle_common_msg(int client_fd, const vector<char>& data) {
+    (void)client_fd;  // 告诉编译器该参数有意未使用
+
+    size_t offset = 0;
+    CommonMsg msg;
+
+    // 反序列化from_user_id
+    if (offset + sizeof(int) > data.size()) {
+        cerr << "handle_common_msg: 缺少from_user_id" << endl;
+        return;
+    }
+    memcpy(&msg.from_user_id, data.data() + offset, sizeof(int));
+    offset += sizeof(int);
+
+    // 反序列化to_user_id
+    if (offset + sizeof(int) > data.size()) {
+        cerr << "handle_common_msg: 缺少to_user_id" << endl;
+        return;
+    }
+    memcpy(&msg.to_user_id, data.data() + offset, sizeof(int));
+    offset += sizeof(int);
+
+    // 反序列化from_nickname
+    msg.from_nickname = deserialize_string(data, offset);
+    // 反序列化content
+    msg.content = deserialize_string(data, offset);
+
+    // 查找目标用户并转发消息
+    lock_guard<mutex> lock(g_mutex);
+    auto to_user_it = g_online_users.find(msg.to_user_id);
+    if (to_user_it == g_online_users.end()) {
+        cerr << "目标用户ID=" << msg.to_user_id << "不在线，消息转发失败" << endl;
+        return;
+    }
+
+    // 直接转发消息给目标用户
+    if (!send_packet(to_user_it->second.manage_port, MsgType::COMMON_MSG, data)) {
+        cerr << "转发消息给用户ID=" << msg.to_user_id << "失败" << endl;
+    } else {
+        cout << "用户ID=" << msg.from_user_id << "向ID=" << msg.to_user_id << "发送消息：" << msg.content << endl;
+    }
+}
+
 // 读取完整数据包（处理粘包，支持非阻塞模式）
 bool recv_complete_packet(int fd, PacketHeader& header, vector<char>& data, bool& is_eagain) {
     is_eagain = false;
@@ -467,6 +511,9 @@ int main() {
                                 break;
                             case MsgType::HEARTBEAT:
                                 handle_heartbeat(fd);
+                                break;
+                            case MsgType::COMMON_MSG:
+                                handle_common_msg(fd, data);
                                 break;
                             default:
                                 cout << "收到未知消息类型：" << (int)header.msg_type << "，来自FD=" << fd << endl;

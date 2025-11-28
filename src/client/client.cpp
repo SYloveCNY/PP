@@ -434,44 +434,77 @@ int connect_peer(int target_user_id) {
 
 // 5. 发送普通文本消息
 void send_common_msg() {
+    // 1. 显示在线用户列表供选择
     cout << "\n=====================================" << endl;
-    cout << "           发送普通消息" << endl;
+    cout << "           选择收信人" << endl;
     cout << "=====================================" << endl;
+    lock_guard<mutex> lock(g_mutex);
+    if (g_online_users.empty()) {
+        cout << "❌ 当前无在线用户" << endl;
+        return;
+    }
+    for (auto& [user_id, user] : g_online_users) {
+        if (user_id == g_user_id) continue; // 跳过自己
+        cout << "ID: " << user_id << "，昵称: " << user.nickname << endl;
+    }
 
-    show_online_users();
-    int target_id = get_valid_target_id();
-    if (target_id == -1) return;
+    // 2. 输入目标用户ID
+    int to_user_id;
+    cout << "请输入收信人ID: ";
+    cin >> to_user_id;
+    cin.ignore(numeric_limits<streamsize>::max(), '\n'); // 清除输入缓冲区
 
-    int peer_fd = connect_peer(target_id);
-    if (peer_fd < 0) return;
-
-    cout << "请输入消息内容（输入exit取消）：" << endl;
-    string content;
-    getline(cin, content);
-    if (content == "exit") {
-        cout << "ℹ️  已取消发送消息。" << endl;
+    // 检查目标用户是否在线（排除自己）
+    if (to_user_id == g_user_id) {
+        cout << "❌ 不能向自己发送消息" << endl;
+        return;
+    }
+    if (g_online_users.find(to_user_id) == g_online_users.end()) {
+        cout << "❌ 目标用户不在线" << endl;
         return;
     }
 
-    // 构造消息并发送
+    // 3. 输入消息内容（支持多行，输入:send结束）
+    cout << "\n请输入消息内容（输入 \":send\" 发送，回车换行）：" << endl;
+    string content;
+    string line;
+    while (true) {
+        getline(cin, line);
+        if (line == ":send") {
+            break; // 输入:send时结束编辑
+        }
+        content += line + "\n"; // 保留换行符
+    }
+    if (content.empty()) {
+        cout << "❌ 消息内容不能为空" << endl;
+        return;
+    }
+
+    // 4. 构造消息并发送
     CommonMsg msg;
     msg.from_user_id = g_user_id;
+    msg.to_user_id = to_user_id;
     msg.from_nickname = g_nickname;
     msg.content = content;
 
-    vector<char> msg_data;
-    auto from_nickname_data = serialize_string(msg.from_nickname);
+    // 序列化消息
+    vector<char> data;
+    // 序列化from_user_id
+    data.insert(data.end(), (char*)&msg.from_user_id, (char*)&msg.from_user_id + sizeof(int));
+    // 序列化to_user_id
+    data.insert(data.end(), (char*)&msg.to_user_id, (char*)&msg.to_user_id + sizeof(int));
+    // 序列化from_nickname
+    auto nickname_data = serialize_string(msg.from_nickname);
+    data.insert(data.end(), nickname_data.begin(), nickname_data.end());
+    // 序列化content
     auto content_data = serialize_string(msg.content);
-    msg_data.insert(msg_data.end(), (char*)&msg.from_user_id, (char*)&msg.from_user_id + sizeof(int));
-    msg_data.insert(msg_data.end(), from_nickname_data.begin(), from_nickname_data.end());
-    msg_data.insert(msg_data.end(), content_data.begin(), content_data.end());
+    data.insert(data.end(), content_data.begin(), content_data.end());
 
-    if (send_packet(peer_fd, MsgType::COMMON_MSG, msg_data)) {
-        cout << "✅ 消息发送成功！" << endl;
+    // 发送消息（通过点对点连接或服务端转发，这里假设通过服务端转发）
+    if (send_packet(g_server_fd, MsgType::COMMON_MSG, data)) {
+        cout << "✅ 消息已发送" << endl;
     } else {
         cout << "❌ 消息发送失败" << endl;
-        g_peer_fds.erase(target_id);
-        close(peer_fd);
     }
 }
 
