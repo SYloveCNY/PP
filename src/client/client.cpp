@@ -17,80 +17,145 @@
 #include <limits>
 #include <chrono>
 #include <termios.h>
+#include <cstdio>
+#include <csignal>
+#include <cctype>
 #include "protocol.h"
 
 using namespace std;
 namespace fs = filesystem;
 
-// ====================== 新增：函数原型声明 ======================
-// 提前声明 recvCompletePacket，让 handlePeerMsg 能调用
-bool recvCompletePacket(int fd, PacketHeader& header, vector<char>& data);
-// （可选：如果还有其他函数调用顺序问题，可在此处添加其他声明，如 sendPacket）
-void setNonblocking(int fd);
-bool sendPacket(int fd, MsgType msgType, const vector<char>& data);
-// ===============================================================
-
 // 客户端配置常量
-const int BUF_SIZE = 4096;              // 缓冲区大小
-const int SERVER_PORT = 8888;           // 服务端通信端口
-const int DATA_PORT = 9999;             // 点对点数据传输端口
-const int FILE_CHUNK_SIZE = 4096;       // 文件分片大小
-const int HEARTBEAT_INTERVAL = 10;      // 心跳发送间隔（秒）
+const int BUF_SIZE = 4096;
+const int SERVER_PORT = 8888;
+const int DATA_PORT = 9999;
+const int FILE_CHUNK_SIZE = 4096;
+const int HEARTBEAT_INTERVAL = 10;
 
-// 全局共享数据
-mutex gMutex;                          // 全局互斥锁
-atomic<bool> gRunning = true;          // 程序运行标志
-int gServerFd = -1;                   // 与服务端通信的Socket FD
-int gUserId = -1;                     // 自身用户ID
-string gNickname;                      // 自身昵称
-vector<char> gAvatar;                  // 自身头像二进制数据
-map<int, UserInfo> gOnlineUsers;      // 在线用户列表（user_id -> UserInfo）
-map<int, int> gPeerFds;               // 点对点连接缓存（对方user_id -> 连接FD）
+// 全局共享数据（统一驼峰命名，与现有代码一致）
+mutex gMutex;
+atomic<bool> gRunning = true;
+int gServerFd = -1;
+int gUserId = -1;
+string gNickname;
+vector<char> gAvatar;
+map<int, UserInfo> gOnlineUsers;
+map<int, int> gPeerFds;
 
-// 处理点对点消息
-void handlePeerMsg(int peerFd) {
-    while (gRunning) {
-        PacketHeader header;
-        vector<char> data;
-        if (!recvCompletePacket(peerFd, header, data)) {
-            cerr << "点对点连接读取失败，FD=" << peerFd << endl;
+// 终端模式全局变量
+static struct termios oldTermios, newTermios;
+
+// 函数原型声明（统一驼峰命名）
+void signalHandler(int signum);
+void saveTerminalMode();
+void restoreTerminalMode();
+bool isCtrlEnter();
+string readInputWithHotkeys();
+void setNonBlocking(int fd);
+bool sendPacket(int fd, MsgType msgType, const vector<char>& data);
+bool recvCompletePacket(int fd, PacketHeader& header, vector<char>& data);
+vector<char> readFile(const string& filePath);
+bool saveFile(const string& filePath, const vector<char>& data);
+void heartbeatSendThread();
+void peerListenThread();
+bool login();
+void showOnlineUsers();
+int getValidTargetId();
+int connectPeer(int targetUserId);
+void sendCommonMsg();
+void sendImageMsg();
+void sendFile();
+void handleServerMsg();
+void handlePeerMsg(int peerFd);
+
+// 信号处理函数（程序退出时恢复终端模式）
+void signalHandler(int signum) {
+    gRunning = false;
+    restoreTerminalMode();
+    cout << "\n📢 收到退出信号，程序正在安全退出..." << endl;
+    exit(signum);
+}
+
+// 保存终端原始模式
+void saveTerminalMode() {
+    tcgetattr(STDIN_FILENO, &oldTermios);
+    newTermios = oldTermios;
+    // 禁用规范模式+回显，逐字符读取
+    newTermios.c_lflag &= ~(ICANON | ECHO);
+    newTermios.c_cc[VMIN] = 1;
+    newTermios.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newTermios);
+}
+
+// 恢复终端原始模式
+void restoreTerminalMode() {
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldTermios);
+}
+
+// 检测是否为Ctrl+Enter组合键
+bool isCtrlEnter() {
+    char c;
+    // 非阻塞读取下一个字符
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    
+    ssize_t ret = read(STDIN_FILENO, &c, 1);
+    
+    // 恢复阻塞模式
+    fcntl(STDIN_FILENO, F_SETFL, flags);
+    
+    if (ret == 1 && c == '\n') {
+        return true;
+    } else if (ret == 1) {
+        ungetc(c, stdin);
+    }
+    return false;
+}
+
+// 读取带特殊按键处理的输入（回车发送，Ctrl+Enter换行）
+string readInputWithHotkeys() {
+    saveTerminalMode();
+    string input;
+    char c;
+    
+    while (true) {
+        if (read(STDIN_FILENO, &c, 1) != 1) {
             break;
         }
-
-        switch (header.msgType) {
-            case MsgType::COMMON_MSG: {
-                CommonMsg msg;
-                size_t offset = 0;
-                memcpy(&msg.fromUserId, data.data() + offset, sizeof(int));
-                offset += sizeof(int);
-                msg.fromNickname = deserializeString(data, offset);
-                msg.content = deserializeString(data, offset);
-                
-                lock_guard<mutex> lock(gMutex);
-                cout << "\n📩 收到来自 " << msg.fromNickname << " 的消息：" << endl;
-                cout << msg.content << endl;
-                break;
+        
+        // 处理退格键（ASCII 127 或 '\b'）
+        if (c == 127 || c == '\b') {
+            if (!input.empty()) {
+                input.pop_back();
+                cout << "\b \b" << flush;
             }
-            default:
-                cerr << "未知的点对点消息类型：" << (int)header.msgType << endl;
+            continue;
+        }
+        
+        // 处理Ctrl+Enter（先'\r'再'\n'）
+        if (c == '\r') {
+            if (isCtrlEnter()) {
+                input += '\n';
+                cout << endl << flush;
+                continue;
+            } else {
+                break; // 普通回车，结束输入
+            }
+        }
+        
+        // 普通字符（过滤不可见字符）
+        if (isprint(c) || c == '\t') {
+            input += c;
+            cout << c << flush;
         }
     }
-
-    // 清理连接
-    lock_guard<mutex> lock(gMutex);
-    for (auto it = gPeerFds.begin(); it != gPeerFds.end();) {
-        if (it->second == peerFd) {
-            it = gPeerFds.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    close(peerFd);
-    cout << "点对点连接已关闭，FD=" << peerFd << endl;
+    
+    restoreTerminalMode();
+    return input;
 }
 
 // 设置Socket为非阻塞模式
-void setNonblocking(int fd) {
+void setNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl F_GETFL failed");
@@ -101,17 +166,19 @@ void setNonblocking(int fd) {
     }
 }
 
-// 发送完整数据包
+// 发送完整数据包（头部+数据）
 bool sendPacket(int fd, MsgType msgType, const vector<char>& data) {
     PacketHeader header;
     header.msgType = msgType;
     header.dataLen = data.size();
 
+    // 发送头部
     if (send(fd, &header, sizeof(PacketHeader), 0) != sizeof(PacketHeader)) {
         perror("send header failed");
         return false;
     }
 
+    // 发送数据
     size_t sent = 0;
     while (sent < data.size()) {
         ssize_t ret = send(fd, data.data() + sent, data.size() - sent, 0);
@@ -124,17 +191,19 @@ bool sendPacket(int fd, MsgType msgType, const vector<char>& data) {
     return true;
 }
 
-// 接收完整数据包
+// 接收完整数据包（处理粘包）
 bool recvCompletePacket(int fd, PacketHeader& header, vector<char>& data) {
+    // 读取头部
     ssize_t ret = recv(fd, &header, sizeof(PacketHeader), 0);
     if (ret == -1) {
         perror("recv header failed");
         return false;
     } else if (ret != sizeof(PacketHeader)) {
-        cerr << "recv header incomplete: 期望" << sizeof(PacketHeader) << "字节，实际" << ret << "字节" << endl;
+        cerr << "recv header incomplete" << endl;
         return false;
     }
 
+    // 读取数据
     data.resize(header.dataLen);
     size_t recved = 0;
     while (recved < header.dataLen) {
@@ -143,7 +212,7 @@ bool recvCompletePacket(int fd, PacketHeader& header, vector<char>& data) {
             perror("recv data failed");
             return false;
         } else if (ret == 0) {
-            cerr << "connection closed while receiving data" << endl;
+            cerr << "connection closed" << endl;
             return false;
         }
         recved += ret;
@@ -180,7 +249,7 @@ bool saveFile(const string& filePath, const vector<char>& data) {
     file.write(data.data(), data.size());
     file.close();
 
-    cout << "✅ 文件已保存至：" << filePath << "，大小：" << data.size() << "字节" << endl;
+    cout << "✅ 文件已保存至：" << filePath << endl;
     return true;
 }
 
@@ -189,7 +258,7 @@ void heartbeatSendThread() {
     while (gRunning && gServerFd != -1) {
         this_thread::sleep_for(chrono::seconds(HEARTBEAT_INTERVAL));
         if (!sendPacket(gServerFd, MsgType::HEARTBEAT, {})) {
-            cout << "❌ 心跳包发送失败，与服务端连接可能已断开" << endl;
+            cout << "❌ 心跳包发送失败，连接已断开" << endl;
             gRunning = false;
             break;
         }
@@ -204,280 +273,54 @@ void peerListenThread() {
         return;
     }
 
+    // 端口复用
     int opt = 1;
     if (setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        perror("❌ 点对点监听setsockopt失败");
+        perror("❌ setsockopt失败");
         close(listenFd);
         return;
     }
 
+    // 绑定端口
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(DATA_PORT);
     if (bind(listenFd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("❌ 点对点监听bind失败");
+        perror("❌ bind失败");
         close(listenFd);
         return;
     }
 
+    // 开始监听
     if (listen(listenFd, 5) < 0) {
-        perror("❌ 点对点监听listen失败");
+        perror("❌ listen失败");
         close(listenFd);
         return;
     }
 
-    cout << "✅ 点对点数据传输监听已启动，端口：" << DATA_PORT << endl;
+    cout << "✅ 点对点监听已启动，端口：" << DATA_PORT << endl;
 
+    // 接受连接
     while (gRunning) {
         sockaddr_in peerAddr;
         socklen_t addrLen = sizeof(peerAddr);
         int peerFd = accept(listenFd, (sockaddr*)&peerAddr, &addrLen);
         if (peerFd < 0) {
-            perror("❌ 点对点accept失败");
+            perror("❌ accept失败");
             continue;
         }
 
         string peerIp = inet_ntoa(peerAddr.sin_addr);
-        cout << "\n📥 收到新的点对点连接：IP=" << peerIp << "，FD=" << peerFd << endl;
+        cout << "\n📥 新点对点连接：IP=" << peerIp << "，FD=" << peerFd << endl;
 
-        setNonblocking(peerFd);
+        setNonBlocking(peerFd);
         thread peerMsgThread(handlePeerMsg, peerFd);
         peerMsgThread.detach();
     }
 
     close(listenFd);
-}
-
-// 从服务端接收消息的线程
-void recvServerMsgThread() {
-    while (gRunning) {
-        PacketHeader header;
-        vector<char> data;
-        if (!recvCompletePacket(gServerFd, header, data)) {
-            cerr << "与服务端通信异常，即将退出" << endl;
-            gRunning = false;
-            break;
-        }
-
-        switch (header.msgType) {
-            case MsgType::LOGIN_RSP: {
-                LoginRsp rsp = deserializeLoginRsp(data);
-                if (rsp.success) {
-                    gUserId = rsp.userId;
-                    cout << "✅ " << rsp.msg << "，你的用户ID：" << gUserId << endl;
-                } else {
-                    cout << "❌ 登录失败：" << rsp.msg << endl;
-                    gRunning = false;
-                }
-                break;
-            }
-            case MsgType::USER_ONLINE_NOTIFY: {
-                size_t offset = 0;
-                UserInfo user;
-                user.nickname = deserializeString(data, offset);
-                user.avatar = deserializeVector(data, offset);
-                user.ip = deserializeString(data, offset);
-                memcpy(&user.userId, data.data() + offset, sizeof(int));
-                offset += sizeof(int);
-                memcpy(&user.dataPort, data.data() + offset, sizeof(uint16_t));
-                
-                lock_guard<mutex> lock(gMutex);
-                gOnlineUsers[user.userId] = user;
-                cout << "\n📢 用户上线：" << user.nickname << "（ID：" << user.userId << "）" << endl;
-                break;
-            }
-            case MsgType::USER_OFFLINE_NOTIFY: {
-                int userId;
-                string nickname;
-                memcpy(&userId, data.data(), sizeof(int));
-                nickname = string(data.data() + sizeof(int), data.size() - sizeof(int));
-                
-                lock_guard<mutex> lock(gMutex);
-                gOnlineUsers.erase(userId);
-                cout << "\n📢 用户下线：" << nickname << "（ID：" << userId << "）" << endl;
-                break;
-            }
-            case MsgType::USER_LIST_RSP: {
-                size_t offset = 0;
-                size_t userCount;
-                memcpy(&userCount, data.data(), sizeof(size_t));
-                offset += sizeof(size_t);
-                
-                lock_guard<mutex> lock(gMutex);
-                gOnlineUsers.clear();
-                for (size_t i = 0; i < userCount; ++i) {
-                    UserInfo user;
-                    user.nickname = deserializeString(data, offset);
-                    user.avatar = deserializeVector(data, offset);
-                    user.ip = deserializeString(data, offset);
-                    memcpy(&user.userId, data.data() + offset, sizeof(int));
-                    offset += sizeof(int);
-                    memcpy(&user.dataPort, data.data() + offset, sizeof(uint16_t));
-                    offset += sizeof(uint16_t);
-                    gOnlineUsers[user.userId] = user;
-                }
-                cout << "✅ 已获取在线用户列表，共 " << userCount << " 人" << endl;
-                break;
-            }
-            default:
-                cerr << "收到未知类型的服务端消息：" << (int)header.msgType << endl;
-        }
-    }
-}
-
-// 请求在线用户列表
-void requestUserList() {
-    if (gServerFd == -1) {
-        cout << "❌ 未连接到服务端" << endl;
-        return;
-    }
-    if (!sendPacket(gServerFd, MsgType::USER_LIST_REQ, {})) {
-        cout << "❌ 请求用户列表失败" << endl;
-    }
-}
-
-// 选择收信人并确认
-int selectRecipient() {
-    lock_guard<mutex> lock(gMutex);
-    if (gOnlineUsers.empty()) {
-        cout << "当前没有在线用户" << endl;
-        return -1;
-    }
-
-    cout << "\n===== 在线用户列表 =====" << endl;
-    for (const auto& [userId, userInfo] : gOnlineUsers) {
-        if (userId == gUserId) continue;
-        cout << userId << ". " << userInfo.nickname << "（IP：" << userInfo.ip << "）" << endl;
-    }
-
-    int targetUserId;
-    cout << "请选择收信人ID: ";
-    cin >> targetUserId;
-    cin.ignore(numeric_limits<streamsize>::max(), '\n');
-
-    auto it = gOnlineUsers.find(targetUserId);
-    if (it == gOnlineUsers.end() || targetUserId == gUserId) {
-        cout << "无效的用户ID" << endl;
-        return -1;
-    }
-
-    cout << "你选择的收信人是: " << it->second.nickname << " (ID: " << targetUserId << ")" << endl;
-    cout << "确认发送消息给该用户? (y/n): ";
-    string confirm;
-    getline(cin, confirm);
-    if (confirm != "y" && confirm != "Y") {
-        cout << "已取消发送" << endl;
-        return -1;
-    }
-
-    return targetUserId;
-}
-
-// 获取点对点连接FD（不存在则创建）
-int getPeerFd(int targetUserId) {
-    lock_guard<mutex> lock(gMutex);
-    auto it = gPeerFds.find(targetUserId);
-    if (it != gPeerFds.end()) {
-        return it->second;
-    }
-
-    auto userIt = gOnlineUsers.find(targetUserId);
-    if (userIt == gOnlineUsers.end()) {
-        return -1;
-    }
-
-    int peerFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (peerFd < 0) {
-        perror("创建点对点Socket失败");
-        return -1;
-    }
-
-    sockaddr_in peerAddr;
-    memset(&peerAddr, 0, sizeof(peerAddr));
-    peerAddr.sin_family = AF_INET;
-    peerAddr.sin_port = htons(userIt->second.dataPort);
-    if (inet_pton(AF_INET, userIt->second.ip.c_str(), &peerAddr.sin_addr) <= 0) {
-        perror("无效的 peer IP");
-        close(peerFd);
-        return -1;
-    }
-
-    if (connect(peerFd, (sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
-        perror("连接到 peer 失败");
-        close(peerFd);
-        return -1;
-    }
-
-    setNonblocking(peerFd);
-    gPeerFds[targetUserId] = peerFd;
-    
-    thread peerMsgThread(handlePeerMsg, peerFd);
-    peerMsgThread.detach();
-    
-    return peerFd;
-}
-
-// 消息输入处理（回车换行，Ctrl+Enter发送）
-string inputMessage() {
-    cout << "\n请输入消息内容（Ctrl+Enter发送，回车换行）: " << endl;
-    string message;
-    struct termios oldT, newT;
-    
-    tcgetattr(STDIN_FILENO, &oldT);
-    newT = oldT;
-    newT.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newT);
-
-    while (true) {
-        char c = getchar();
-        if (c == '\n') {
-            struct termios tempT;
-            tcgetattr(STDIN_FILENO, &tempT);
-            if ((tempT.c_cc[VINTR] & 0x1F) == 0x0A) { // Ctrl+Enter
-                break;
-            } else {
-                message += '\n';
-                cout << endl;
-            }
-        } else {
-            message += c;
-            cout << c;
-        }
-    }
-
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldT);
-    return message;
-}
-
-// 发送消息
-void sendMessage(int targetUserId) {
-    string content = inputMessage();
-    if (content.empty()) {
-        cout << "消息内容不能为空" << endl;
-        return;
-    }
-
-    CommonMsg msg;
-    msg.fromUserId = gUserId;
-    msg.fromNickname = gNickname;
-    msg.content = content;
-
-    vector<char> data;
-    auto fromNicknameData = serializeString(msg.fromNickname);
-    auto contentData = serializeString(msg.content);
-    
-    data.insert(data.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
-    data.insert(data.end(), fromNicknameData.begin(), fromNicknameData.end());
-    data.insert(data.end(), contentData.begin(), contentData.end());
-
-    int peerFd = getPeerFd(targetUserId);
-    if (peerFd == -1 || !sendPacket(peerFd, MsgType::COMMON_MSG, data)) {
-        cout << "消息发送失败" << endl;
-    } else {
-        cout << "\n消息已发送，无法修改或删除" << endl;
-    }
 }
 
 // 登录流程
@@ -486,47 +329,50 @@ bool login() {
     cout << "          聊天客户端 - 登录" << endl;
     cout << "=====================================" << endl;
 
+    // 输入昵称
     cout << "请输入你的昵称：";
     cin >> gNickname;
     cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
-    cout << "请输入头像文件路径（如：./avatar.jpg，无头像直接回车）：";
+    // 输入头像
+    cout << "请输入头像文件路径（无头像直接回车）：";
     string avatarPath;
     getline(cin, avatarPath);
     if (!avatarPath.empty()) {
         gAvatar = readFile(avatarPath);
         if (gAvatar.empty()) {
-            cout << "⚠️  头像文件读取失败，将使用默认空头像" << endl;
-        } else {
-            cout << "✅ 头像读取成功，大小：" << gAvatar.size() << "字节" << endl;
+            cout << "⚠️  头像读取失败，使用默认头像" << endl;
         }
     } else {
-        cout << "ℹ️  未设置头像，将使用默认空头像" << endl;
+        cout << "ℹ️  未设置头像" << endl;
     }
 
+    // 创建服务端Socket
     gServerFd = socket(AF_INET, SOCK_STREAM, 0);
     if (gServerFd < 0) {
         perror("❌ 服务端Socket创建失败");
         return false;
     }
 
+    // 连接服务端
     sockaddr_in serverAddr;
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr) <= 0) {
-        perror("❌ 无效的服务端IP");
+        perror("❌ 无效服务端IP");
         close(gServerFd);
         return false;
     }
 
     if (connect(gServerFd, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        perror("❌ 连接服务端失败（请确保服务端已启动）");
+        perror("❌ 连接服务端失败");
         close(gServerFd);
         return false;
     }
-    cout << "✅ 已连接服务端（IP：127.0.0.1，端口：" << SERVER_PORT << "）" << endl;
+    cout << "✅ 已连接服务端（127.0.0.1:" << SERVER_PORT << "）" << endl;
 
+    // 发送登录请求
     LoginReq req;
     req.nickname = gNickname;
     req.avatar = gAvatar;
@@ -535,13 +381,38 @@ bool login() {
     vector<char> reqData;
     auto nicknameData = serializeString(req.nickname);
     auto avatarData = serializeVector(req.avatar);
-    
     reqData.insert(reqData.end(), nicknameData.begin(), nicknameData.end());
     reqData.insert(reqData.end(), avatarData.begin(), avatarData.end());
     reqData.insert(reqData.end(), (char*)&req.dataPort, (char*)&req.dataPort + sizeof(uint16_t));
 
     if (!sendPacket(gServerFd, MsgType::LOGIN_REQ, reqData)) {
-        cout << "❌ 发送登录请求失败" << endl;
+        cout << "❌ 登录请求发送失败" << endl;
+        close(gServerFd);
+        return false;
+    }
+
+    // 接收登录响应
+    PacketHeader header;
+    vector<char> rspData;
+    if (!recvCompletePacket(gServerFd, header, rspData) || header.msgType != MsgType::LOGIN_RSP) {
+        cout << "❌ 登录响应接收失败" << endl;
+        close(gServerFd);
+        return false;
+    }
+
+    LoginRsp rsp = deserializeLoginRsp(rspData);
+    if (!rsp.success) {
+        cout << "❌ 登录失败：" << rsp.msg << endl;
+        close(gServerFd);
+        return false;
+    }
+
+    gUserId = rsp.userId;
+    cout << "🎉 登录成功！用户ID：" << gUserId << "，提示：" << rsp.msg << endl;
+
+    // 请求在线用户列表
+    if (!sendPacket(gServerFd, MsgType::USER_LIST_REQ, {})) {
+        cout << "❌ 用户列表请求失败" << endl;
         close(gServerFd);
         return false;
     }
@@ -549,71 +420,612 @@ bool login() {
     return true;
 }
 
-// 主循环
-void mainLoop() {
+// 显示在线用户列表
+void showOnlineUsers() {
+    lock_guard<mutex> lock(gMutex);
+    cout << "\n=====================================" << endl;
+    cout << "           在线用户列表" << endl;
+    cout << "=====================================" << endl;
+    if (gOnlineUsers.empty()) {
+        cout << "⚠️  当前无在线用户" << endl;
+        cout << "=====================================" << endl;
+        return;
+    }
+
+    for (auto& [userId, user] : gOnlineUsers) {
+        if (userId == gUserId) {
+            cout << "ID：" << userId << "（自己） | 昵称：" << user.nickname << " | IP：" << user.ip << endl;
+        } else {
+            cout << "ID：" << userId << " | 昵称：" << user.nickname << " | IP：" << user.ip << " | 端口：" << user.dataPort << endl;
+        }
+    }
+    cout << "=====================================" << endl;
+}
+
+// 获取有效的目标用户ID
+int getValidTargetId() {
+    int targetUserId = -1;
+    while (true) {
+        cout << "请输入目标用户ID（-1取消）：";
+        cin >> targetUserId;
+
+        if (cin.fail()) {
+            cin.clear();
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            cout << "❌ 输入错误，请输入整数ID" << endl;
+            continue;
+        }
+
+        if (targetUserId == -1) {
+            cout << "ℹ️  已取消" << endl;
+            return -1;
+        }
+
+        if (targetUserId == gUserId) {
+            cout << "❌ 不能选择自己" << endl;
+            continue;
+        }
+
+        lock_guard<mutex> lock(gMutex);
+        if (gOnlineUsers.find(targetUserId) == gOnlineUsers.end()) {
+            cout << "❌ 用户不存在或已下线" << endl;
+            showOnlineUsers();
+            continue;
+        }
+
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        return targetUserId;
+    }
+}
+
+// 建立点对点连接
+int connectPeer(int targetUserId) {
+    lock_guard<mutex> lock(gMutex);
+
+    auto userIt = gOnlineUsers.find(targetUserId);
+    if (userIt == gOnlineUsers.end()) {
+        cout << "❌ 目标用户不在线" << endl;
+        return -1;
+    }
+
+    auto peerIt = gPeerFds.find(targetUserId);
+    if (peerIt != gPeerFds.end()) {
+        return peerIt->second;
+    }
+
+    // 创建连接
+    int peerFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (peerFd < 0) {
+        perror("❌ 点对点Socket创建失败");
+        return -1;
+    }
+
+    sockaddr_in peerAddr;
+    memset(&peerAddr, 0, sizeof(peerAddr));
+    peerAddr.sin_family = AF_INET;
+    peerAddr.sin_port = htons(userIt->second.dataPort);
+    if (inet_pton(AF_INET, userIt->second.ip.c_str(), &peerAddr.sin_addr) <= 0) {
+        perror("❌ 无效IP");
+        close(peerFd);
+        return -1;
+    }
+
+    if (connect(peerFd, (sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
+        perror("❌ 连接失败");
+        close(peerFd);
+        return -1;
+    }
+
+    cout << "✅ 已连接用户：" << userIt->second.nickname << "（ID:" << targetUserId << "）" << endl;
+    gPeerFds[targetUserId] = peerFd;
+    return peerFd;
+}
+
+// 发送普通消息（回车发送，Ctrl+Enter换行）
+void sendCommonMsg() {
+    cout << "\n=====================================" << endl;
+    cout << "           发送普通消息" << endl;
+    cout << "=====================================" << endl;
+
+    showOnlineUsers();
+    int targetUserId = getValidTargetId();
+    if (targetUserId == -1) return;
+
+    int peerFd = connectPeer(targetUserId);
+    if (peerFd < 0) return;
+
+    cout << "\n请输入消息内容（回车发送，Ctrl+Enter换行）：" << endl;
+    string content = readInputWithHotkeys();
+
+    if (content.empty()) {
+        cout << "❌ 消息内容不能为空" << endl;
+        return;
+    }
+
+    // 构造消息
+    CommonMsg msg;
+    msg.fromUserId = gUserId;
+    msg.fromNickname = gNickname;
+    msg.toUserId = targetUserId;
+    msg.content = content;
+
+    // 序列化
+    vector<char> msgData;
+    auto nicknameData = serializeString(msg.fromNickname);
+    auto contentData = serializeString(msg.content);
+    msgData.insert(msgData.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
+    msgData.insert(msgData.end(), (char*)&msg.toUserId, (char*)&msg.toUserId + sizeof(int));
+    msgData.insert(msgData.end(), nicknameData.begin(), nicknameData.end());
+    msgData.insert(msgData.end(), contentData.begin(), contentData.end());
+
+    if (sendPacket(peerFd, MsgType::COMMON_MSG, msgData)) {
+        cout << "\n✅ 消息发送成功！" << endl;
+    } else {
+        cout << "\n❌ 消息发送失败" << endl;
+        gPeerFds.erase(targetUserId);
+        close(peerFd);
+    }
+}
+
+// 发送图片消息
+void sendImageMsg() {
+    cout << "\n=====================================" << endl;
+    cout << "           发送图片消息" << endl;
+    cout << "=====================================" << endl;
+
+    showOnlineUsers();
+    int targetUserId = getValidTargetId();
+    if (targetUserId == -1) return;
+
+    int peerFd = connectPeer(targetUserId);
+    if (peerFd < 0) return;
+
+    cout << "请输入图片路径（exit取消）：";
+    string imgPath;
+    getline(cin, imgPath);
+    if (imgPath == "exit") {
+        cout << "ℹ️  已取消" << endl;
+        return;
+    }
+
+    vector<char> imgData = readFile(imgPath);
+    if (imgData.empty()) return;
+
+    fs::path path(imgPath);
+    string imgName = path.filename().string();
+
+    // 构造消息
+    ImageMsg msg;
+    msg.fromUserId = gUserId;
+    msg.fromNickname = gNickname;
+    msg.toUserId = targetUserId;
+    msg.imgName = imgName;
+    msg.imgData = imgData;
+
+    // 序列化
+    vector<char> msgData;
+    auto nicknameData = serializeString(msg.fromNickname);
+    auto imgNameData = serializeString(msg.imgName);
+    auto imgDataData = serializeVector(msg.imgData);
+    msgData.insert(msgData.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
+    msgData.insert(msgData.end(), (char*)&msg.toUserId, (char*)&msg.toUserId + sizeof(int));
+    msgData.insert(msgData.end(), nicknameData.begin(), nicknameData.end());
+    msgData.insert(msgData.end(), imgNameData.begin(), imgNameData.end());
+    msgData.insert(msgData.end(), imgDataData.begin(), imgDataData.end());
+
+    if (sendPacket(peerFd, MsgType::IMAGE_MSG, msgData)) {
+        cout << "✅ 图片发送成功！" << endl;
+    } else {
+        cout << "❌ 图片发送失败" << endl;
+        gPeerFds.erase(targetUserId);
+        close(peerFd);
+    }
+}
+
+// 发送文件
+void sendFile() {
+    cout << "\n=====================================" << endl;
+    cout << "             发送文件" << endl;
+    cout << "=====================================" << endl;
+
+    showOnlineUsers();
+    int targetUserId = getValidTargetId();
+    if (targetUserId == -1) return;
+
+    int peerFd = connectPeer(targetUserId);
+    if (peerFd < 0) return;
+
+    cout << "请输入文件路径（exit取消）：";
+    string filePath;
+    getline(cin, filePath);
+    if (filePath == "exit") {
+        cout << "ℹ️  已取消" << endl;
+        return;
+    }
+
+    vector<char> fileData = readFile(filePath);
+    if (fileData.empty()) return;
+
+    fs::path path(filePath);
+    string fileName = path.filename().string();
+    uint64_t fileSize = fileData.size();
+
+    // 发送文件请求
+    FileReq req;
+    req.fromUserId = gUserId;
+    req.fromNickname = gNickname;
+    req.toUserId = targetUserId;
+    req.fileName = fileName;
+    req.fileSize = fileSize;
+
+    vector<char> reqData;
+    auto nicknameData = serializeString(req.fromNickname);
+    auto fileNameData = serializeString(req.fileName);
+    reqData.insert(reqData.end(), (char*)&req.fromUserId, (char*)&req.fromUserId + sizeof(int));
+    reqData.insert(reqData.end(), (char*)&req.toUserId, (char*)&req.toUserId + sizeof(int));
+    reqData.insert(reqData.end(), nicknameData.begin(), nicknameData.end());
+    reqData.insert(reqData.end(), fileNameData.begin(), fileNameData.end());
+    reqData.insert(reqData.end(), (char*)&req.fileSize, (char*)&req.fileSize + sizeof(uint64_t));
+
+    if (!sendPacket(peerFd, MsgType::FILE_REQ, reqData)) {
+        cout << "❌ 文件请求发送失败" << endl;
+        gPeerFds.erase(targetUserId);
+        close(peerFd);
+        return;
+    }
+
+    // 分片发送文件
+    uint32_t seq = 0;
+    size_t totalChunks = (fileSize + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
+    for (size_t i = 0; i < totalChunks; ++i) {
+        size_t chunkSize = min((size_t)FILE_CHUNK_SIZE, fileSize - i * FILE_CHUNK_SIZE);
+        vector<char> chunkData(fileData.begin() + i * FILE_CHUNK_SIZE, 
+                                fileData.begin() + i * FILE_CHUNK_SIZE + chunkSize);
+
+        vector<char> pktData;
+        pktData.resize(sizeof(uint32_t) + chunkSize);
+        uint32_t currentSeq = seq++;
+        memcpy(pktData.data(), &currentSeq, sizeof(uint32_t));
+        memcpy(pktData.data() + sizeof(uint32_t), chunkData.data(), chunkSize);
+
+        if (!sendPacket(peerFd, MsgType::FILE_DATA, pktData)) {
+            cout << "❌ 分片 " << (i + 1) << "/" << totalChunks << " 发送失败" << endl;
+            gPeerFds.erase(targetUserId);
+            close(peerFd);
+            return;
+        }
+
+        // 显示进度
+        cout << "📤 传输中：" << (i + 1) << "/" << totalChunks 
+             << "（" << (i + 1) * 100 / totalChunks << "%）" << "\r" << flush;
+    }
+
+    // 发送结束通知
+    sendPacket(peerFd, MsgType::FILE_END, {});
+    cout << "\n✅ 文件传输完成！" << endl;
+}
+
+// 处理服务端消息
+void handleServerMsg() {
     while (gRunning) {
-        cout << "\n===== 功能菜单 =====" << endl;
-        cout << "1. 查看在线用户" << endl;
-        cout << "2. 发送消息" << endl;
+        PacketHeader header;
+        vector<char> data;
+        if (!recvCompletePacket(gServerFd, header, data)) {
+            cout << "\n❌ 与服务端连接断开" << endl;
+            gRunning = false;
+            break;
+        }
+
+        switch (header.msgType) {
+            case MsgType::USER_LIST_RSP: {
+                lock_guard<mutex> lock(gMutex);
+                gOnlineUsers.clear();
+                size_t offset = 0;
+
+                // 读取用户数量
+                size_t userCount = 0;
+                if (offset + sizeof(size_t) <= data.size()) {
+                    memcpy(&userCount, data.data() + offset, sizeof(size_t));
+                    offset += sizeof(size_t);
+                }
+                cout << "\nℹ️  在线用户数：" << userCount << endl;
+
+                // 读取每个用户
+                for (size_t i = 0; i < userCount; ++i) {
+                    UserInfo user;
+                    user.nickname = deserializeString(data, offset);
+                    user.avatar = deserializeVector(data, offset);
+                    user.ip = deserializeString(data, offset);
+
+                    if (offset + sizeof(int) <= data.size()) {
+                        memcpy(&user.userId, data.data() + offset, sizeof(int));
+                        offset += sizeof(int);
+                    }
+                    if (offset + sizeof(uint16_t) <= data.size()) {
+                        memcpy(&user.dataPort, data.data() + offset, sizeof(uint16_t));
+                        offset += sizeof(uint16_t);
+                    }
+
+                    gOnlineUsers[user.userId] = user;
+                    cout << "ℹ️  加载用户：ID=" << user.userId << "，昵称=" << user.nickname << endl;
+                }
+
+                cout << "\n✅ 在线用户列表已更新" << endl;
+                showOnlineUsers();
+                break;
+            }
+
+            case MsgType::USER_ONLINE_NOTIFY: {
+                lock_guard<mutex> lock(gMutex);
+                UserInfo user;
+                size_t offset = 0;
+
+                user.nickname = deserializeString(data, offset);
+                user.avatar = deserializeVector(data, offset);
+                user.ip = deserializeString(data, offset);
+                if (offset + sizeof(int) <= data.size()) {
+                    memcpy(&user.userId, data.data() + offset, sizeof(int));
+                    offset += sizeof(int);
+                }
+                if (offset + sizeof(uint16_t) <= data.size()) {
+                    memcpy(&user.dataPort, data.data() + offset, sizeof(uint16_t));
+                    offset += sizeof(uint16_t);
+                }
+
+                gOnlineUsers[user.userId] = user;
+                cout << "\n📢 【上线通知】" << user.nickname << "（ID:" << user.userId << "）已上线" << endl;
+                showOnlineUsers();
+                break;
+            }
+
+            case MsgType::USER_OFFLINE_NOTIFY: {
+                lock_guard<mutex> lock(gMutex);
+                if (data.size() < sizeof(int)) break;
+
+                int userId = 0;
+                memcpy(&userId, data.data(), sizeof(int));
+                string nickname(data.data() + sizeof(int), data.size() - sizeof(int));
+
+                gOnlineUsers.erase(userId);
+                gPeerFds.erase(userId);
+
+                cout << "\n📢 【下线通知】" << nickname << "（ID:" << userId << "）已下线" << endl;
+                showOnlineUsers();
+                break;
+            }
+
+            default:
+                cout << "\n❓ 未知服务端消息类型：" << (int)header.msgType << endl;
+                break;
+        }
+    }
+}
+
+// 处理点对点消息
+void handlePeerMsg(int peerFd) {
+    while (gRunning) {
+        PacketHeader header;
+        vector<char> data;
+        if (!recvCompletePacket(peerFd, header, data)) {
+            cout << "\n❌ 点对点连接已断开" << endl;
+            // 清理连接
+            lock_guard<mutex> lock(gMutex);
+            for (auto it = gPeerFds.begin(); it != gPeerFds.end(); ) {
+                if (it->second == peerFd) {
+                    it = gPeerFds.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            close(peerFd);
+            break;
+        }
+
+        switch (header.msgType) {
+            case MsgType::COMMON_MSG: {
+                size_t offset = 0;
+                int fromUserId = 0;
+                int toUserId = 0;
+                memcpy(&fromUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                memcpy(&toUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                string fromNickname = deserializeString(data, offset);
+                string content = deserializeString(data, offset);
+
+                // 只处理发给自己的消息
+                if (toUserId == gUserId) {
+                    cout << "\n📩 【消息】来自 " << fromNickname << "（ID:" << fromUserId << "）：" << endl;
+                    cout << content << endl;
+                    // 重新显示菜单提示
+                    cout << "\n请输入操作序号（1-5）：";
+                    cout.flush();
+                }
+                break;
+            }
+
+            case MsgType::IMAGE_MSG: {
+                size_t offset = 0;
+                int fromUserId = 0;
+                int toUserId = 0;
+                memcpy(&fromUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                memcpy(&toUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                string fromNickname = deserializeString(data, offset);
+                string imgName = deserializeString(data, offset);
+                vector<char> imgData = deserializeVector(data, offset);
+
+                if (toUserId == gUserId) {
+                    cout << "\n📩 【图片消息】来自 " << fromNickname << "（ID:" << fromUserId << "）" << endl;
+                    saveFile("./recv_" + imgName, imgData);
+                    cout << "\n请输入操作序号（1-5）：";
+                    cout.flush();
+                }
+                break;
+            }
+
+            case MsgType::FILE_REQ: {
+                size_t offset = 0;
+                int fromUserId = 0;
+                int toUserId = 0;
+                memcpy(&fromUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                memcpy(&toUserId, data.data() + offset, sizeof(int));
+                offset += sizeof(int);
+                string fromNickname = deserializeString(data, offset);
+                string fileName = deserializeString(data, offset);
+                uint64_t fileSize = 0;
+                memcpy(&fileSize, data.data() + offset, sizeof(uint64_t));
+                offset += sizeof(uint64_t);
+
+                if (toUserId == gUserId) {
+                    cout << "\n📩 【文件请求】来自 " << fromNickname << "（ID:" << fromUserId << "）" << endl;
+                    cout << "文件名：" << fileName << " | 大小：" << fileSize << "字节" << endl;
+                    cout << "是否接收？（y/n）：";
+                    char choice;
+                    cin >> choice;
+                    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+                    if (choice != 'y' && choice != 'Y') {
+                        cout << "ℹ️  已拒绝" << endl;
+                        gPeerFds.erase(fromUserId);
+                        close(peerFd);
+                        break;
+                    }
+
+                    // 接收文件分片
+                    vector<char> recvFileData;
+                    recvFileData.reserve(fileSize);
+                    bool fileComplete = false;
+
+                    cout << "📥 开始接收文件..." << endl;
+                    while (gRunning && !fileComplete) {
+                        PacketHeader fileHeader;
+                        vector<char> fileData;
+                        if (!recvCompletePacket(peerFd, fileHeader, fileData)) {
+                            cout << "❌ 文件传输中断" << endl;
+                            break;
+                        }
+
+                        switch (fileHeader.msgType) {
+                            case MsgType::FILE_DATA: {
+                                if (fileData.size() >= sizeof(uint32_t)) {
+                                    vector<char> chunkData(fileData.begin() + sizeof(uint32_t), fileData.end());
+                                    recvFileData.insert(recvFileData.end(), chunkData.begin(), chunkData.end());
+
+                                    // 显示进度
+                                    cout << "📥 接收中：" << recvFileData.size() << "/" << fileSize 
+                                         << "（" << recvFileData.size() * 100 / fileSize << "%）" << "\r" << flush;
+                                }
+                                break;
+                            }
+
+                            case MsgType::FILE_END: {
+                                fileComplete = true;
+                                cout << "\n✅ 文件接收完成！" << endl;
+                                saveFile("./recv_" + fileName, recvFileData);
+                                cout << "\n请输入操作序号（1-5）：";
+                                cout.flush();
+                                break;
+                            }
+
+                            default:
+                                cout << "❓ 未知文件消息类型" << endl;
+                                break;
+                        }
+                    }
+                }
+                break;
+            }
+
+            default:
+                cout << "\n❓ 未知点对点消息类型：" << (int)header.msgType << endl;
+                break;
+        }
+    }
+}
+
+// 主函数
+int main() {
+    // 注册信号处理
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+    
+    // 登录
+    if (!login()) {
+        cout << "❌ 登录失败，程序退出" << endl;
+        restoreTerminalMode();
+        return -1;
+    }
+
+    // 启动后台线程
+    thread heartbeatT(heartbeatSendThread);
+    thread peerListenT(peerListenThread);
+    thread serverMsgT(handleServerMsg);
+
+    // 线程分离
+    heartbeatT.detach();
+    peerListenT.detach();
+    serverMsgT.detach();
+
+    // 主菜单循环
+    while (gRunning) {
+        cout << "\n=====================================" << endl;
+        cout << "          聊天客户端 - 主菜单" << endl;
+        cout << "=====================================" << endl;
+        cout << "1. 发送普通消息" << endl;
+        cout << "2. 发送图片消息" << endl;
         cout << "3. 发送文件" << endl;
-        cout << "4. 退出" << endl;
-        cout << "请选择功能: ";
-        
+        cout << "4. 查看在线用户列表" << endl;
+        cout << "5. 退出程序" << endl;
+        cout << "=====================================" << endl;
+        cout << "请输入操作序号（1-5）：";
+        cout.flush();
+
         int choice;
         cin >> choice;
         cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
         switch (choice) {
             case 1:
-                requestUserList();
+                sendCommonMsg();
                 break;
-            case 2: {
-                int targetUserId = selectRecipient();
-                if (targetUserId != -1) {
-                    sendMessage(targetUserId);
-                }
+            case 2:
+                sendImageMsg();
                 break;
-            }
             case 3:
-                cout << "文件发送功能待实现" << endl;
+                sendFile();
                 break;
             case 4:
+                showOnlineUsers();
+                break;
+            case 5:
                 gRunning = false;
+                cout << "ℹ️  正在退出程序..." << endl;
                 break;
             default:
-                cout << "无效的选择" << endl;
+                cout << "❌ 输入错误！请输入1-5之间的序号。" << endl;
+                break;
         }
     }
-}
 
-int main() {
-    // 登录流程
-    if (!login()) {
-        return 1;
+    // 资源释放
+    {
+        lock_guard<mutex> lock(gMutex);
+        for (auto& [userId, peerFd] : gPeerFds) {
+            close(peerFd);
+        }
+        gPeerFds.clear();
+        gOnlineUsers.clear();
     }
 
-    // 启动辅助线程
-    thread recvThread(recvServerMsgThread);
-    thread heartbeatThread(heartbeatSendThread);
-    thread peerListenThreadInst(peerListenThread); 
-
-    // 进入主交互循环
-    mainLoop();
-
-    // 清理资源
-    gRunning = false;
-    close(gServerFd);
-    
-    lock_guard<mutex> lock(gMutex);
-    for (auto& [userId, fd] : gPeerFds) {
-        close(fd);
+    if (gServerFd != -1) {
+        close(gServerFd);
+        gServerFd = -1;
     }
 
-    // 等待线程结束
-    if (recvThread.joinable()) recvThread.join();
-    if (heartbeatThread.joinable()) heartbeatThread.join();
-    if (peerListenThreadInst.joinable()) peerListenThreadInst.join();
-
-    cout << "客户端已退出" << endl;
+    restoreTerminalMode();
+    cout << "✅ 程序已安全退出" << endl;
     return 0;
 }

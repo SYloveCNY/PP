@@ -54,25 +54,28 @@ struct UserInfo {
 
 // 普通文本消息结构体
 struct CommonMsg {
-    int fromUserId;       // 发送者用户ID
+    int fromUserId;       // 发送者ID
+    int toUserId;         // 新增：接收者ID（解决编译错误）
     std::string fromNickname; // 发送者昵称
-    std::string content;    // 消息内容
+    std::string content;  // 消息内容
 };
 
 // 图片消息结构体
 struct ImageMsg {
-    int fromUserId;       // 发送者用户ID
+    int fromUserId;       // 发送者ID
+    int toUserId;         // 新增：接收者ID
     std::string fromNickname; // 发送者昵称
-    std::string imgName;   // 图片文件名
+    std::string imgName;  // 图片文件名
     std::vector<char> imgData; // 图片二进制数据
 };
 
 // 文件传输请求结构体
 struct FileReq {
-    int fromUserId;       // 发送者用户ID
+    int fromUserId;       // 发送者ID
+    int toUserId;         // 新增：接收者ID
     std::string fromNickname; // 发送者昵称
-    std::string fileName;  // 文件名
-    uint64_t fileSize;     // 文件总大小
+    std::string fileName; // 文件名称
+    uint64_t fileSize;    // 文件大小（字节）
 };
 
 // 文件分片数据结构体
