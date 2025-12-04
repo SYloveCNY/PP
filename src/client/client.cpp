@@ -92,64 +92,71 @@ void restoreTerminalMode() {
     tcsetattr(STDIN_FILENO, TCSANOW, &oldTermios);
 }
 
-// 检测是否为Ctrl+Enter组合键
+// 1. 修正：检测Ctrl+Enter组合键（先读'\r'，再读'\n'）
 bool isCtrlEnter() {
-    char c;
-    // 非阻塞读取下一个字符
+    char next = 0;
+    // 非阻塞读取下一个字符（判断是否为'\n'）
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     
-    ssize_t ret = read(STDIN_FILENO, &c, 1);
+    ssize_t ret = read(STDIN_FILENO, &next, 1);
     
     // 恢复阻塞模式
     fcntl(STDIN_FILENO, F_SETFL, flags);
     
-    if (ret == 1 && c == '\n') {
+    // Ctrl+Enter的特征：先读到'\r'，下一个字符是'\n'
+    if (ret == 1 && next == '\n') {
         return true;
     } else if (ret == 1) {
-        ungetc(c, stdin);
+        ungetc(next, stdin); // 放回非'\n'的字符
     }
     return false;
 }
 
-// 读取带特殊按键处理的输入（回车发送，Ctrl+Enter换行）
+// 2. 修正：读取输入的主逻辑（核心修复）
 string readInputWithHotkeys() {
     saveTerminalMode();
     string input;
     char c;
     
     while (true) {
+        // 逐字符读取输入
         if (read(STDIN_FILENO, &c, 1) != 1) {
             break;
         }
         
-        // 处理退格键（ASCII 127 或 '\b'）
+        // 处理退格键（兼容ASCII 127和'\b'）
         if (c == 127 || c == '\b') {
             if (!input.empty()) {
                 input.pop_back();
+                // 屏幕回显：删除最后一个字符（\b移光标→空格覆盖→\b再移光标）
                 cout << "\b \b" << flush;
             }
             continue;
         }
         
-        // 处理Ctrl+Enter（先'\r'再'\n'）
-        if (c == '\r') {
+        // 核心逻辑：区分普通回车和Ctrl+Enter
+        if (c == '\n') { 
+            // 普通回车（仅'\n'）→ 结束输入，触发发送
+            break;
+        } else if (c == '\r') { 
+            // 检测到'\r'→ 可能是Ctrl+Enter，检查下一个字符是否为'\n'
             if (isCtrlEnter()) {
-                input += '\n';
-                cout << endl << flush;
-                continue;
-            } else {
-                break; // 普通回车，结束输入
+                input += '\n'; // 插入换行符
+                cout << endl << flush; // 屏幕显示换行
             }
+            continue;
         }
         
-        // 普通字符（过滤不可见字符）
+        // 普通可见字符→ 加入输入，手动回显
         if (isprint(c) || c == '\t') {
             input += c;
             cout << c << flush;
         }
     }
     
+    // 输入结束后，换行显示提示
+    cout << endl;
     restoreTerminalMode();
     return input;
 }
@@ -535,21 +542,23 @@ void sendCommonMsg() {
     if (peerFd < 0) return;
 
     cout << "\n请输入消息内容（回车发送，Ctrl+Enter换行）：" << endl;
-    string content = readInputWithHotkeys();
+    cout << "-------------------------------------" << endl;
+    string content = readInputWithHotkeys(); // 调用修复后的输入函数
+    cout << "-------------------------------------" << endl;
 
     if (content.empty()) {
         cout << "❌ 消息内容不能为空" << endl;
         return;
     }
 
-    // 构造消息
+    // 构造消息（确保to_user_id字段与protocol.h一致）
     CommonMsg msg;
     msg.fromUserId = gUserId;
     msg.fromNickname = gNickname;
-    msg.toUserId = targetUserId;
+    msg.toUserId = targetUserId; // 重点：与protocol.h的字段名保持一致！
     msg.content = content;
 
-    // 序列化
+    // 序列化消息
     vector<char> msgData;
     auto nicknameData = serializeString(msg.fromNickname);
     auto contentData = serializeString(msg.content);
@@ -559,9 +568,9 @@ void sendCommonMsg() {
     msgData.insert(msgData.end(), contentData.begin(), contentData.end());
 
     if (sendPacket(peerFd, MsgType::COMMON_MSG, msgData)) {
-        cout << "\n✅ 消息发送成功！" << endl;
+        cout << "✅ 消息发送成功！" << endl;
     } else {
-        cout << "\n❌ 消息发送失败" << endl;
+        cout << "❌ 消息发送失败" << endl;
         gPeerFds.erase(targetUserId);
         close(peerFd);
     }

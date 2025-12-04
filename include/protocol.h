@@ -1,165 +1,185 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
-#include <vector>
 #include <string>
-#include <chrono>
+#include <vector>
+#include <map>
+#include <cstdint>
+#include <chrono>  // 新增：支持时间戳（心跳检测）
 
 // 消息类型枚举
 enum class MsgType {
-    LOGIN_REQ = 1,       // 登录请求
-    LOGIN_RSP = 2,       // 登录响应
-    USER_ONLINE_NOTIFY = 3,  // 用户上线通知
-    USER_OFFLINE_NOTIFY = 4, // 用户下线通知
-    USER_LIST_REQ = 5,   // 在线用户列表请求
-    USER_LIST_RSP = 6,   // 在线用户列表响应
-    COMMON_MSG = 7,      // 普通文本消息
-    IMAGE_MSG = 8,       // 图片消息
-    FILE_REQ = 9,        // 文件传输请求
-    FILE_DATA = 10,      // 文件分片数据
-    FILE_END = 11,       // 文件传输结束
-    HEARTBEAT = 12       // 心跳包
+    LOGIN_REQ = 1,
+    LOGIN_RSP = 2,
+    USER_LIST_REQ = 3,
+    USER_LIST_RSP = 4,
+    COMMON_MSG = 5,
+    IMAGE_MSG = 6,
+    FILE_REQ = 7,
+    FILE_DATA = 8,
+    FILE_END = 9,
+    HEARTBEAT = 10,
+    USER_ONLINE_NOTIFY = 11,
+    USER_OFFLINE_NOTIFY = 12
 };
 
 // 数据包头部
 struct PacketHeader {
-    MsgType msgType;    // 消息类型
-    size_t dataLen;     // 数据长度
+    MsgType msgType;
+    uint32_t dataLen;
 };
 
-// 登录请求结构体
+// 登录请求
 struct LoginReq {
-    std::string nickname;   // 用户昵称
-    std::vector<char> avatar; // 头像二进制数据
-    uint16_t dataPort;     // 点对点数据传输端口
+    std::string nickname;
+    std::vector<char> avatar;
+    uint16_t dataPort;
 };
 
-// 登录响应结构体
+// 登录响应
 struct LoginRsp {
-    bool success;       // 登录是否成功
-    int userId;         // 分配的用户ID
-    std::string msg;    // 响应提示信息
+    bool success;
+    int userId;
+    std::string msg;
+    std::string nickname;
 };
 
-// 在线用户信息结构体
+// 用户信息（补充服务端需要的字段）
 struct UserInfo {
-    int userId;                 // 用户ID
-    std::string nickname;       // 昵称
-    std::vector<char> avatar;   // 头像数据
-    std::string ip;             // 客户端IP地址
-    uint16_t dataPort;          // 点对点数据传输端口
-    int managePort;             // 服务端管理客户端的连接端口
-    std::chrono::time_point<std::chrono::system_clock> lastHeartbeat; // 最后心跳时间
+    int userId;
+    std::string nickname;
+    std::vector<char> avatar;
+    std::string ip;
+    uint16_t dataPort;          // 客户端点对点端口（原managePort是笔误，统一为dataPort）
+    int managePort;             // 新增：服务端管理的客户端连接FD（原缺失）
+    std::chrono::system_clock::time_point lastHeartbeat; // 新增：心跳时间戳
 };
 
-// 普通文本消息结构体
+// 普通消息
 struct CommonMsg {
-    int fromUserId;       // 发送者ID
-    int toUserId;         // 新增：接收者ID（解决编译错误）
-    std::string fromNickname; // 发送者昵称
-    std::string content;  // 消息内容
+    int fromUserId;
+    int toUserId;  // 统一为toUserId，杜绝to_user_id混用
+    std::string fromNickname;
+    std::string content;
 };
 
-// 图片消息结构体
+// 图片消息
 struct ImageMsg {
-    int fromUserId;       // 发送者ID
-    int toUserId;         // 新增：接收者ID
-    std::string fromNickname; // 发送者昵称
-    std::string imgName;  // 图片文件名
-    std::vector<char> imgData; // 图片二进制数据
+    int fromUserId;
+    int toUserId;
+    std::string fromNickname;
+    std::string imgName;
+    std::vector<char> imgData;
 };
 
-// 文件传输请求结构体
+// 文件请求
 struct FileReq {
-    int fromUserId;       // 发送者ID
-    int toUserId;         // 新增：接收者ID
-    std::string fromNickname; // 发送者昵称
-    std::string fileName; // 文件名称
-    uint64_t fileSize;    // 文件大小（字节）
+    int fromUserId;
+    int toUserId;
+    std::string fromNickname;
+    std::string fileName;
+    uint64_t fileSize;
 };
 
-// 文件分片数据结构体
-struct FileData {
-    uint32_t seq;           // 分片序号
-    std::vector<char> data; // 分片二进制数据
-};
-
-// 序列化字符串
+// ========== 序列化函数（补充服务端需要的serializeLoginRsp） ==========
 inline std::vector<char> serializeString(const std::string& str) {
     std::vector<char> data;
-    size_t len = str.size();
-    data.resize(sizeof(size_t));
-    memcpy(data.data(), &len, sizeof(size_t));
+    uint32_t len = str.size();
+    data.insert(data.end(), (char*)&len, (char*)&len + sizeof(uint32_t));
     data.insert(data.end(), str.begin(), str.end());
     return data;
 }
 
-// 反序列化字符串
 inline std::string deserializeString(const std::vector<char>& data, size_t& offset) {
-    if (offset + sizeof(size_t) > data.size()) return "";
-    size_t len = 0;
-    memcpy(&len, data.data() + offset, sizeof(size_t));
-    offset += sizeof(size_t);
-    if (offset + len > data.size()) return "";
-    std::string str(data.data() + offset, len);
+    uint32_t len = *(uint32_t*)(data.data() + offset);
+    offset += sizeof(uint32_t);
+    std::string str(data.begin() + offset, data.begin() + offset + len);
     offset += len;
     return str;
 }
 
-// 序列化vector<char>
 inline std::vector<char> serializeVector(const std::vector<char>& vec) {
     std::vector<char> data;
-    size_t len = vec.size();
-    data.resize(sizeof(size_t));
-    memcpy(data.data(), &len, sizeof(size_t));
+    uint32_t len = vec.size();
+    data.insert(data.end(), (char*)&len, (char*)&len + sizeof(uint32_t));
     data.insert(data.end(), vec.begin(), vec.end());
     return data;
 }
 
-// 反序列化vector<char>
 inline std::vector<char> deserializeVector(const std::vector<char>& data, size_t& offset) {
-    if (offset + sizeof(size_t) > data.size()) return {};
-    size_t len = 0;
-    memcpy(&len, data.data() + offset, sizeof(size_t));
-    offset += sizeof(size_t);
-    if (offset + len > data.size()) return {};
-    return std::vector<char>(data.data() + offset, data.data() + offset + len);
+    uint32_t len = *(uint32_t*)(data.data() + offset);
+    offset += sizeof(uint32_t);
+    std::vector<char> vec(data.begin() + offset, data.begin() + offset + len);
+    offset += len;
+    return vec;
 }
 
-// 序列化LoginRsp
+// 新增：登录响应序列化（服务端需要）
 inline std::vector<char> serializeLoginRsp(const LoginRsp& rsp) {
     std::vector<char> data;
-    data.push_back(rsp.success ? 1 : 0);
-    data.resize(data.size() + sizeof(int));
-    memcpy(data.data() + data.size() - sizeof(int), &rsp.userId, sizeof(int));
+    data.insert(data.end(), (char*)&rsp.success, sizeof(bool));
+    data.insert(data.end(), (char*)&rsp.userId, sizeof(int));
     auto msgData = serializeString(rsp.msg);
     data.insert(data.end(), msgData.begin(), msgData.end());
+    auto nicknameData = serializeString(rsp.nickname);
+    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
     return data;
 }
 
-// 反序列化LoginRsp
 inline LoginRsp deserializeLoginRsp(const std::vector<char>& data) {
     LoginRsp rsp;
     size_t offset = 0;
-
-    if (offset + 1 > data.size()) {
-        rsp.success = false;
-        rsp.msg = "反序列化失败：缺少success字段";
-        return rsp;
-    }
-    rsp.success = (data[offset] == 1);
-    offset += 1;
-
-    if (offset + sizeof(int) > data.size()) {
-        rsp.success = false;
-        rsp.msg = "反序列化失败：缺少userId字段";
-        return rsp;
-    }
-    memcpy(&rsp.userId, data.data() + offset, sizeof(int));
+    rsp.success = *(bool*)(data.data() + offset);
+    offset += sizeof(bool);
+    rsp.userId = *(int*)(data.data() + offset);
     offset += sizeof(int);
-
     rsp.msg = deserializeString(data, offset);
+    rsp.nickname = deserializeString(data, offset);
     return rsp;
+}
+
+inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data) {
+    std::map<int, UserInfo> users;
+    size_t offset = 0;
+    size_t userCount = *(size_t*)(data.data() + offset);
+    offset += sizeof(size_t);
+
+    for (size_t i = 0; i < userCount; ++i) {
+        UserInfo user;
+        user.nickname = deserializeString(data, offset);
+        user.avatar = deserializeVector(data, offset);
+        user.ip = deserializeString(data, offset);
+        user.userId = *(int*)(data.data() + offset);
+        offset += sizeof(int);
+        user.dataPort = *(uint16_t*)(data.data() + offset);
+        offset += sizeof(uint16_t);
+        users[user.userId] = user;
+    }
+    return users;
+}
+
+inline CommonMsg deserializeCommonMsg(const std::vector<char>& data) {
+    CommonMsg msg;
+    size_t offset = 0;
+    msg.fromUserId = *(int*)(data.data() + offset);
+    offset += sizeof(int);
+    msg.toUserId = *(int*)(data.data() + offset);
+    offset += sizeof(int);
+    msg.fromNickname = deserializeString(data, offset);
+    msg.content = deserializeString(data, offset);
+    return msg;
+}
+
+inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
+    UserInfo user;
+    size_t offset = 0;
+    user.nickname = deserializeString(data, offset);
+    user.avatar = deserializeVector(data, offset);
+    user.ip = deserializeString(data, offset);
+    user.userId = *(int*)(data.data() + offset);
+    offset += sizeof(int);
+    user.dataPort = *(uint16_t*)(data.data() + offset);
+    return user;
 }
 
 #endif // PROTOCOL_H
