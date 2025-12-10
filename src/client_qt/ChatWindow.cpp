@@ -44,7 +44,7 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
     connect(m_serverSocket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
     // 请求在线用户列表
     PacketHeader header;
-    header.msgType = MsgType::USER_LIST_REQ;
+    header.msgType = USER_LIST_REQ;
     header.dataLen = 0;
     QByteArray reqData;
     reqData.append((char*)&header, sizeof(PacketHeader));
@@ -97,25 +97,25 @@ void ChatWindow::onServerReadyRead() {
     std::vector<char> payload(data.begin() + sizeof(PacketHeader), data.end());
 
     switch (header->msgType) {
-        case MsgType::USER_LIST_RSP: {
+        case USER_LIST_RSP: {
             // 修复：map → std::map
             std::map<int, UserInfo> users = deserializeUserList(payload);
             updateOnlineUsers(users);
             break;
         }
-        case MsgType::COMMON_MSG: {
+        case COMMON_MSG: {
             CommonMsg msg = deserializeCommonMsg(payload);
             showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
             break;
         }
-        case MsgType::USER_ONLINE_NOTIFY: {
+        case USER_ONLINE_NOTIFY: {
             UserInfo user = deserializeUserInfo(payload);
             m_onlineUsers[user.userId] = user;
             updateOnlineUsers(m_onlineUsers);
             showMessage("系统通知", QString("%1（ID：%2）已上线").arg(QString::fromStdString(user.nickname)).arg(user.userId));
             break;
         }
-        case MsgType::USER_OFFLINE_NOTIFY: {
+        case USER_OFFLINE_NOTIFY: {
             int userId = *(int*)payload.data();
             // 修复：string → std::string
             std::string nickname(payload.begin() + sizeof(int), payload.end());
@@ -150,7 +150,7 @@ void ChatWindow::onSendClicked() {
     msgData.insert(msgData.end(), nicknameData.begin(), nicknameData.end());
     msgData.insert(msgData.end(), contentData.begin(), contentData.end());
 
-    sendPacket(m_serverSocket, MsgType::COMMON_MSG, msgData);
+    sendPacket(m_serverSocket, COMMON_MSG, msgData);
     showMessage("我", content);
     m_msgInput->clear();
 }

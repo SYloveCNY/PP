@@ -13,7 +13,7 @@
 #include <map>         // 新增
 #include <vector>      // 新增
 #include <string>      // 新增
-#include "protocol.h"
+#include "protocol_qt.h"
 
 class ChatWindow : public QWidget {
     Q_OBJECT
