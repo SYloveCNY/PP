@@ -18,3 +18,6 @@
 
 第七次提交：编译错误问题
 待解决问题：文件与消息传输都改用点对点 QtSocket
+
+第八次提交：编译错误问题
+待解决问题：QIODevice::write (QTcpSocket): device not open 文件与消息传输都改用点对点 QtSocket

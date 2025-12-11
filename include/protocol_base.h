@@ -203,19 +203,28 @@ inline LoginRsp deserializeLoginRsp(const std::vector<char>& data) {
 
 inline std::vector<char> serializeUserInfo(const UserInfo& user) {
     std::vector<char> data;
-    data.insert(data.end(), reinterpret_cast<const char*>(&user.userId),
-                reinterpret_cast<const char*>(&user.userId) + sizeof(int));
+    // 序列化userId（修正insert参数）
+    data.insert(data.end(), 
+               reinterpret_cast<const char*>(&user.userId), 
+               reinterpret_cast<const char*>(&user.userId) + sizeof(int));
+    // 序列化昵称
     auto nicknameData = serializeString(user.nickname);
     data.insert(data.end(), nicknameData.begin(), nicknameData.end());
+    // 序列化头像
     auto avatarData = serializeVector(user.avatar);
     data.insert(data.end(), avatarData.begin(), avatarData.end());
+    // 序列化dataPort（转网络字节序，修正insert参数）
     uint16_t port = htons(user.dataPort);
-    data.insert(data.end(), reinterpret_cast<const char*>(&port),
-                reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
+    data.insert(data.end(), 
+               reinterpret_cast<const char*>(&port), 
+               reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
+    // 序列化IP
     auto ipData = serializeString(user.ip);
     data.insert(data.end(), ipData.begin(), ipData.end());
-    data.insert(data.end(), reinterpret_cast<const char*>(&user.managePort),
-                reinterpret_cast<const char*>(&user.managePort) + sizeof(int));
+    // 序列化managePort（修正insert参数）
+    data.insert(data.end(), 
+               reinterpret_cast<const char*>(&user.managePort), 
+               reinterpret_cast<const char*>(&user.managePort) + sizeof(int));
     return data;
 }
 
