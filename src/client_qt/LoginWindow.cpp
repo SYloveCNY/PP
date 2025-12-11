@@ -9,9 +9,12 @@ LoginWindow::LoginWindow(QWidget *parent) : QWidget(parent) {
     setWindowTitle("聊天客户端 - 登录");
     setFixedSize(400, 300);
 
-    // 控件初始化
-    m_tcpSocket = new QTcpSocket(this);  // 初始化socket，指定父对象自动释放
-    connect(m_tcpSocket, &QTcpSocket::connected, this, &LoginWindow::onConnected);
+    // 初始化 serverSocket（唯一用于连接服务端的套接字）
+    serverSocket = new QTcpSocket(this);
+    // 连接成功后触发 onConnected
+    connect(serverSocket, &QTcpSocket::connected, this, &LoginWindow::onConnected);
+    // 接收服务端响应
+    connect(serverSocket, &QTcpSocket::readyRead, this, &LoginWindow::onReadyRead);
 
     QLabel *titleLabel = new QLabel("🔐 登录");
     titleLabel->setStyleSheet("font-size: 24px; font-weight: bold;");
@@ -106,8 +109,8 @@ void LoginWindow::onConnected() {
                         reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
         sendData.insert(sendData.end(), reqData.begin(), reqData.end());
 
-        // 发送数据（m_tcpSocket已初始化）
-        m_tcpSocket->write(sendData.data(), sendData.size());
+        // 发送数据
+        serverSocket->write(sendData.data(), sendData.size());
     } catch (const std::exception& e) {
         QMessageBox::critical(this, "错误", "序列化失败：" + QString::fromStdString(e.what()));
         loginBtn->setEnabled(true);

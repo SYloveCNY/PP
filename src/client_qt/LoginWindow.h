@@ -23,7 +23,6 @@ private slots:
     void onConnected();
     void onReadyRead();
 private:
-    QTcpSocket* m_tcpSocket;  // 新增：声明tcp socket成员变量
     QLineEdit *nicknameEdit;
     QLineEdit *avatarEdit;
     QPushButton *loginBtn;

@@ -21,3 +21,6 @@
 
 第八次提交：编译错误问题
 待解决问题：QIODevice::write (QTcpSocket): device not open 文件与消息传输都改用点对点 QtSocket
+
+第九次提交：QIODevice::write (QTcpSocket): device not open
+待解决问题：只能打开一个客户端，第二个客户端一直处在连接状态 文件与消息传输都改用点对点 QtSocket
