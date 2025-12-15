@@ -2,6 +2,7 @@
 #define LOGINWINDOW_H
 
 #include <QTcpSocket> 
+#include <QUdpSocket>
 #include <QWidget>
 #include <QLineEdit>
 #include <QPushButton>
@@ -17,12 +18,13 @@ class LoginWindow : public QWidget {
 public:
     LoginWindow(QWidget *parent = nullptr);
 signals:
-    void loginSuccess(int userId, const QString &nickname, QTcpSocket *serverSocket);
+    void loginSuccess(int userId, const QString &nickname, QTcpSocket *serverSocket, QUdpSocket *udpSocket);
 private slots:
     void onLoginClicked();
     void onConnected();
     void onReadyRead();
 private:
+    QUdpSocket *udpSocket; 
     QLineEdit *nicknameEdit;
     QLineEdit *avatarEdit;
     QPushButton *loginBtn;

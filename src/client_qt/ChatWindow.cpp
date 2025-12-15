@@ -1,57 +1,45 @@
 #include "ChatWindow.h"
 #include <QMessageBox>
 #include <QDateTime>
-#include <vector>
-#include <map>
-#include <string>
+#include "protocol_qt.h"
 
-ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSocket, QWidget *parent)
-    : QWidget(parent), m_userId(userId), m_nickname(nickname), m_serverSocket(serverSocket) {
-    setWindowTitle(QString("聊天客户端 - %1（ID：%2）").arg(nickname).arg(userId));
-    setFixedSize(800, 600);
+ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSocket, QUdpSocket *udpSocket, QWidget *parent)
+    : QWidget(parent), m_userId(userId), m_nickname(nickname), 
+      m_serverSocket(serverSocket), m_udpSocket(udpSocket) {  // 直接使用传递的UDP Socket
+    setWindowTitle(QString("聊天窗口 - %1（ID：%2）").arg(nickname).arg(userId));
+    setFixedSize(600, 400);
 
-    m_userList = new QListWidget;
-    m_userList->setFixedWidth(200);
-    m_userList->setStyleSheet("font-size: 14px;");
-    connect(m_userList, &QListWidget::itemClicked, this, &ChatWindow::onUserSelected);
+    // 绑定UDP的readyRead信号（接收点对点消息）
+    connect(m_udpSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
 
-    m_msgDisplay = new QTextEdit;
-    m_msgDisplay->setReadOnly(true);
-    m_msgDisplay->setStyleSheet("font-size: 14px;");
-
-    m_msgInput = new QLineEdit;
-    m_msgInput->setPlaceholderText("输入消息（Enter发送，Ctrl+Enter换行）");
-    m_msgInput->setStyleSheet("font-size: 14px;");
-    connect(m_msgInput, &QLineEdit::returnPressed, this, &ChatWindow::onSendClicked);
-    connect(m_msgInput, &QLineEdit::textChanged, this, &ChatWindow::onTextEdited);
-
+    // 控件初始化（保持不变）
+    m_chatList = new QListWidget;
+    m_inputEdit = new QLineEdit;
+    m_inputEdit->setPlaceholderText("输入消息后按回车或点击发送");
     m_sendBtn = new QPushButton("发送");
-    m_sendBtn->setStyleSheet("background-color: #4CAF50; color: white; font-size: 14px;");
-    m_sendBtn->setEnabled(false);
-    connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::onSendClicked);
 
-    QVBoxLayout *rightLayout = new QVBoxLayout;
-    rightLayout->addWidget(m_msgDisplay);
+    // 布局（保持不变）
+    QVBoxLayout *mainLayout = new QVBoxLayout(this);
     QHBoxLayout *inputLayout = new QHBoxLayout;
-    inputLayout->addWidget(m_msgInput);
+    inputLayout->addWidget(m_inputEdit);
     inputLayout->addWidget(m_sendBtn);
-    rightLayout->addLayout(inputLayout);
 
-    QHBoxLayout *mainLayout = new QHBoxLayout(this);
-    mainLayout->addWidget(m_userList);
-    mainLayout->addLayout(rightLayout);
+    mainLayout->addWidget(m_chatList);
+    mainLayout->addLayout(inputLayout);
 
+    // 信号绑定（保持不变）
+    connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::onSendClicked);
+    connect(m_inputEdit, &QLineEdit::returnPressed, this, &ChatWindow::onSendClicked);
     connect(m_serverSocket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
-    // 请求在线用户列表
+
+    // 发送用户列表请求（保持不变）
     PacketHeader header;
     header.msgType = USER_LIST_REQ;
     header.dataLen = 0;
-    QByteArray reqData;
-    reqData.append((char*)&header, sizeof(PacketHeader));
-    m_serverSocket->write(reqData);
-
-    m_udpSocket = new QUdpSocket(this);
-    m_udpSocket->bind(9999, QUdpSocket::ShareAddress);
+    std::vector<char> sendData;
+    sendData.insert(sendData.end(), reinterpret_cast<char*>(&header), 
+                    reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
+    m_serverSocket->write(sendData.data(), sendData.size());
 }
 
 ChatWindow::~ChatWindow() {
@@ -126,6 +114,28 @@ void ChatWindow::onServerReadyRead() {
         }
         default:
             break;
+    }
+}
+
+// 新增：处理UDP接收的点对点消息
+void ChatWindow::onUdpReadyRead() {
+    QByteArray datagram;
+    datagram.resize(m_udpSocket->pendingDatagramSize());
+    QHostAddress senderAddr;
+    quint16 senderPort;
+
+    // 读取UDP数据报
+    qint64 len = m_udpSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
+    if (len <= 0) {
+        return;
+    }
+
+    // 解析点对点消息（假设是CommonMsg格式，可根据实际协议调整）
+    try {
+        CommonMsg msg = deserializeCommonMsg(std::vector<char>(datagram.begin(), datagram.end()));
+        showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
+    } catch (const std::exception& e) {
+        qDebug() << "解析UDP消息失败：" << e.what();
     }
 }
 

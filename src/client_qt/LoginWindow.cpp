@@ -9,12 +9,19 @@ LoginWindow::LoginWindow(QWidget *parent) : QWidget(parent) {
     setWindowTitle("聊天客户端 - 登录");
     setFixedSize(400, 300);
 
-    // 初始化 serverSocket（唯一用于连接服务端的套接字）
+    // 初始化TCP Socket（与服务端通信）
     serverSocket = new QTcpSocket(this);
-    // 连接成功后触发 onConnected
     connect(serverSocket, &QTcpSocket::connected, this, &LoginWindow::onConnected);
-    // 接收服务端响应
     connect(serverSocket, &QTcpSocket::readyRead, this, &LoginWindow::onReadyRead);
+
+    // 新增：初始化UDP Socket（点对点通信，动态分配端口）
+    udpSocket = new QUdpSocket(this);
+    // 绑定动态端口：QHostAddress::Any表示监听所有网卡，端口0表示让系统分配可用端口
+    if (!udpSocket->bind(QHostAddress::Any, 0)) {
+        QMessageBox::warning(this, "警告", "UDP端口绑定失败：" + udpSocket->errorString());
+        loginBtn->setEnabled(false);  // 绑定失败则禁用登录
+        return;
+    }
 
     QLabel *titleLabel = new QLabel("🔐 登录");
     titleLabel->setStyleSheet("font-size: 24px; font-weight: bold;");
@@ -93,9 +100,13 @@ void LoginWindow::onConnected() {
                 return;
             }
         }
-        req.dataPort = 9999;
 
-        // 序列化登录请求（现在serializeLoginReq已定义）
+        // 替换固定端口9999为动态分配的UDP端口
+        // udpSocket->localPort()：获取系统分配的可用端口（quint16类型）
+        req.dataPort = static_cast<uint16_t>(udpSocket->localPort());
+        qDebug() << "动态分配的点对点端口：" << req.dataPort; 
+
+        // 序列化登录请求
         std::vector<char> reqData = serializeLoginReq(req);
         
         // 组装PacketHeader
@@ -120,12 +131,18 @@ void LoginWindow::onConnected() {
 
 void LoginWindow::onReadyRead() {
     QByteArray data = serverSocket->readAll();
-    PacketHeader *header = (PacketHeader*)data.data();
+    if (data.size() < sizeof(PacketHeader)) {
+        QMessageBox::warning(this, "警告", "收到无效响应");
+        return;
+    }
+
+    PacketHeader *header = reinterpret_cast<PacketHeader*>(data.data());
     if (header->msgType == LOGIN_RSP) {
-        LoginRsp rsp = deserializeLoginRsp(std::vector<char>(data.begin() + sizeof(PacketHeader), data.end())); // 修复：添加std::
+        LoginRsp rsp = deserializeLoginRsp(std::vector<char>(data.begin() + sizeof(PacketHeader), data.end()));
         if (rsp.success) {
-            QMessageBox::information(this, "成功", QString("登录成功！用户ID：%1\n提示：%2").arg(rsp.userId).arg(QString::fromStdString(rsp.msg)));
-            emit loginSuccess(rsp.userId, QString::fromStdString(rsp.nickname), serverSocket);
+            QMessageBox::information(this, "成功", QString("登录成功！用户ID：%1").arg(rsp.userId));
+            // 正确传递4个参数（含 udpSocket）
+            emit loginSuccess(rsp.userId, QString::fromStdString(rsp.nickname), serverSocket, udpSocket);
             this->close();
         } else {
             QMessageBox::critical(this, "失败", QString("登录失败：%1").arg(QString::fromStdString(rsp.msg)));
