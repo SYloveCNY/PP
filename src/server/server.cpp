@@ -24,6 +24,7 @@ void broadcastPacket(uint32_t msgType, const std::vector<char>& data, int exclud
 void handleLoginReq(int clientFd, const std::vector<char>& data);
 void handleHeartbeat(int clientFd);
 void heartbeatCheckThread();
+bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data);
 
 // 修复广播函数（managePort → dataPort/managePort）
 void broadcastPacket(MsgType msgType, const std::vector<char>& data, int excludeFd) {
@@ -114,6 +115,35 @@ void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg
     std::vector<char> rspData = serializeLoginRsp(rsp);
     // 发送响应
     sendPacket(clientFd, LOGIN_RSP, rspData);
+}
+
+// server.cpp 新增：完整读取数据包函数
+bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data) {
+    // 读取头部
+    ssize_t ret = recv(fd, &header, sizeof(PacketHeader), 0);
+    if (ret == -1) {
+        perror("recv header failed");
+        return false;
+    } else if (ret != sizeof(PacketHeader)) {
+        std::cerr << "recv header incomplete" << std::endl;
+        return false;
+    }
+
+    // 读取数据
+    data.resize(header.dataLen);
+    size_t recved = 0;
+    while (recved < header.dataLen) {
+        ret = recv(fd, data.data() + recved, header.dataLen - recved, 0);
+        if (ret == -1) {
+            perror("recv data failed");
+            return false;
+        } else if (ret == 0) {
+            std::cerr << "connection closed" << std::endl;
+            return false;
+        }
+        recved += ret;
+    }
+    return true;
 }
 
 // 服务端主函数（程序入口）

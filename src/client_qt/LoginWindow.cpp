@@ -60,11 +60,6 @@ LoginWindow::LoginWindow(QWidget *parent) : QWidget(parent) {
     mainLayout->addLayout(avatarLayout);
     mainLayout->addSpacing(30);
     mainLayout->addWidget(loginBtn);
-
-    // 服务端连接
-    serverSocket = new QTcpSocket(this);
-    connect(serverSocket, &QTcpSocket::connected, this, &LoginWindow::onConnected);
-    connect(serverSocket, &QTcpSocket::readyRead, this, &LoginWindow::onReadyRead);
 }
 
 void LoginWindow::onLoginClicked() {
