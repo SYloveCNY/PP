@@ -1,36 +1,65 @@
 #include "ChatWindow.h"
-#include <QMessageBox>
 #include <QDateTime>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
 #include "protocol_qt.h"
 
+// 构造函数（完整实现，修复信号绑定）
 ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSocket, QUdpSocket *udpSocket, QWidget *parent)
-    : QWidget(parent), m_userId(userId), m_nickname(nickname), 
-      m_serverSocket(serverSocket), m_udpSocket(udpSocket) {  // 直接使用传递的UDP Socket
+    : QWidget(parent), m_userId(userId), m_nickname(nickname),
+      m_serverSocket(serverSocket), m_udpSocket(udpSocket) {
+    // 窗口配置
     setWindowTitle(QString("聊天窗口 - %1（ID：%2）").arg(nickname).arg(userId));
-    setFixedSize(600, 400);
+    setFixedSize(800, 500); // 扩大窗口，容纳用户列表
 
-    // 绑定UDP的readyRead信号（接收点对点消息）
-    connect(m_udpSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
-
-    // 控件初始化（保持不变）
+    // 初始化控件（新增用户列表+标题标签）
     m_chatList = new QListWidget;
-    m_inputEdit = new QLineEdit;
-    m_inputEdit->setPlaceholderText("输入消息后按回车或点击发送");
+    
+    // 新增：用户列表标题标签（替代 placeholder）
+    QLabel *userListTitle = new QLabel("在线用户");
+    userListTitle->setStyleSheet("font-weight: bold; text-align: center;");
+    userListTitle->setAlignment(Qt::AlignCenter);
+
+    m_userList = new QListWidget; // 在线用户列表UI
+    m_userList->setFixedWidth(150);
+    // 移除这行错误代码：m_userList->setPlaceholderText("在线用户");
+
+    m_inputEdit = new QTextEdit;
+    m_inputEdit->setPlaceholderText("输入消息后按Ctrl+Enter发送");
+    m_inputEdit->setMaximumHeight(80);
     m_sendBtn = new QPushButton("发送");
 
-    // 布局（保持不变）
-    QVBoxLayout *mainLayout = new QVBoxLayout(this);
+    // 布局（左侧：标题+用户列表；右侧：聊天区域）
+    QHBoxLayout *mainLayout = new QHBoxLayout(this);
+    QVBoxLayout *userListLayout = new QVBoxLayout; // 新增：用户列表+标题的布局
+    QVBoxLayout *chatLayout = new QVBoxLayout;
     QHBoxLayout *inputLayout = new QHBoxLayout;
+
+    // 左侧布局：标题标签 + 用户列表
+    userListLayout->addWidget(userListTitle);
+    userListLayout->addWidget(m_userList);
+    userListLayout->setContentsMargins(0, 0, 10, 0); // 右侧留间距
+
+    // 输入区布局
     inputLayout->addWidget(m_inputEdit);
     inputLayout->addWidget(m_sendBtn);
 
-    mainLayout->addWidget(m_chatList);
-    mainLayout->addLayout(inputLayout);
+    // 右侧布局：聊天记录 + 输入区
+    chatLayout->addWidget(m_chatList);
+    chatLayout->addLayout(inputLayout);
+
+    // 主布局：左侧用户列表 + 右侧聊天区域
+    mainLayout->addLayout(userListLayout); // 替换直接添加 m_userList
+    mainLayout->addLayout(chatLayout);
+    mainLayout->setStretch(0, 1);
+    mainLayout->setStretch(1, 3);
 
     // 信号绑定（保持不变）
-    connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::onSendClicked);
-    connect(m_inputEdit, &QLineEdit::returnPressed, this, &ChatWindow::onSendClicked);
+    connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::sendMessage);
     connect(m_serverSocket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
+    connect(m_udpSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
+    connect(m_userList, &QListWidget::itemClicked, this, &ChatWindow::onUserSelected);
+    connect(m_inputEdit, &QTextEdit::textChanged, this, &ChatWindow::onTextEdited);
 
     // 发送用户列表请求（保持不变）
     PacketHeader header;
@@ -42,53 +71,121 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
     m_serverSocket->write(sendData.data(), sendData.size());
 }
 
+// 析构函数实现（匹配头文件声明）
 ChatWindow::~ChatWindow() {
-    m_serverSocket->close();
-    m_udpSocket->close();
+    // 可选：释放资源（QT父对象会自动管理，可留空）
 }
 
-// 修复：函数定义匹配声明（std::vector）
-void ChatWindow::sendPacket(QTcpSocket *socket, MsgType msgType, const std::vector<char> &data) {
-    PacketHeader header;
-    header.msgType = msgType;
-    header.dataLen = data.size();
-    QByteArray sendData;
-    sendData.append((char*)&header, sizeof(PacketHeader));
-    sendData.append(data.data(), data.size());
-    socket->write(sendData);
-}
+// 发送消息核心函数（已有实现，保持不变）
+void ChatWindow::sendMessage() {
+    QString content = m_inputEdit->toPlainText().trimmed();
+    if (content.isEmpty()) return;
 
-// 修复：函数定义匹配声明（std::map）
-void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo> &users) {
-    m_onlineUsers = users;
-    m_userList->clear();
-    for (auto &[userId, user] : users) {
-        QString itemText = QString("%1（ID：%2）").arg(QString::fromStdString(user.nickname)).arg(userId);
-        if (userId == m_userId) {
-            itemText += "（自己）";
-        }
-        QListWidgetItem *item = new QListWidgetItem(itemText);
-        item->setData(Qt::UserRole, userId);
-        m_userList->addItem(item);
+    // 检查TCP连接状态
+    if (m_serverSocket->state() != QAbstractSocket::ConnectedState) {
+        QMessageBox::warning(this, "错误", "连接已断开，无法发送消息");
+        return;
+    }
+
+    try {
+        CommonMsg msg;
+        msg.fromUserId = m_userId;
+        msg.fromNickname = m_nickname.toStdString();
+        msg.content = content.toStdString();
+        msg.toUserId = m_selectedUserId; // 0=广播，选中用户则为目标ID
+
+        // 序列化消息（调用protocol_qt.h中的全局sendPacket，而非类内函数）
+        std::vector<char> msgData = serializeCommonMsg(msg);
+        PacketHeader header;
+        header.msgType = COMMON_MSG;
+        header.dataLen = static_cast<uint32_t>(msgData.size());
+
+        std::vector<char> sendData;
+        sendData.insert(sendData.end(), reinterpret_cast<char*>(&header), 
+                        reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
+        sendData.insert(sendData.end(), msgData.begin(), msgData.end());
+
+        // 直接调用socket发送（避免依赖类内sendPacket）
+        m_serverSocket->write(sendData.data(), sendData.size());
+
+        // 显示自己的消息
+        showMessage("我", content);
+        m_inputEdit->clear();
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, "错误", "消息序列化失败：" + QString::fromStdString(e.what()));
     }
 }
 
-void ChatWindow::showMessage(const QString &sender, const QString &content) {
-    QString time = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
-    m_msgDisplay->append(QString("[%1] %2：\n%3\n").arg(time).arg(sender).arg(content));
+void ChatWindow::onSendClicked() {
+    sendMessage();
 }
 
+// 新增：文本编辑框变化槽函数（实现）
+void ChatWindow::onTextEdited() {
+    // 可选：处理文本变化逻辑（如按钮状态控制）
+    m_sendBtn->setEnabled(!m_inputEdit->toPlainText().trimmed().isEmpty());
+}
+
+// 新增：用户选择槽函数（实现）
+void ChatWindow::onUserSelected(QListWidgetItem *item) {
+    if (!item) return;
+    // 解析用户列表项（格式："昵称 (ID: 1)"）
+    QString text = item->text();
+    int idStart = text.indexOf("ID: ") + 4;
+    int idEnd = text.indexOf(")", idStart);
+    if (idStart < 4 || idEnd == -1) {
+        m_selectedUserId = 0; // 解析失败则广播
+        return;
+    }
+    m_selectedUserId = text.mid(idStart, idEnd - idStart).toInt();
+    qDebug() << "选中用户ID：" << m_selectedUserId;
+}
+
+// 重写键盘事件（捕捉回车发送，修复QTextEdit无returnPressed）
+void ChatWindow::keyPressEvent(QKeyEvent *event) {
+    // 按下Ctrl+Enter或Enter发送（避免单行回车换行）
+    if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) && 
+        (event->modifiers() & Qt::ControlModifier)) {
+        sendMessage();
+    } else if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+        // 普通Enter换行（可选，根据需求调整）
+        m_inputEdit->insertPlainText("\n");
+    } else {
+        QWidget::keyPressEvent(event); // 其他按键默认处理
+    }
+}
+
+// 新增：更新在线用户列表（实现，解决未声明错误）
+void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo> &users) {
+    m_userList->clear(); // 清空现有列表
+    // 添加"广播"选项
+    m_userList->addItem(QString("广播 (ID: 0)"));
+    // 添加所有在线用户
+    for (const auto &pair : users) {
+        const UserInfo &user = pair.second;
+        QString itemText = QString("%1 (ID: %2)").arg(QString::fromStdString(user.nickname)).arg(user.userId);
+        m_userList->addItem(itemText);
+    }
+}
+
+// 接收服务端消息（修复updateOnlineUsers和m_onlineUsers调用）
 void ChatWindow::onServerReadyRead() {
     QByteArray data = m_serverSocket->readAll();
-    PacketHeader *header = (PacketHeader*)data.data();
-    // 修复：vector → std::vector
+    if (data.size() < sizeof(PacketHeader)) {
+        showMessage("系统", "收到无效消息");
+        return;
+    }
+
+    PacketHeader *header = reinterpret_cast<PacketHeader*>(data.data());
     std::vector<char> payload(data.begin() + sizeof(PacketHeader), data.end());
 
     switch (header->msgType) {
         case USER_LIST_RSP: {
-            // 修复：map → std::map
             std::map<int, UserInfo> users = deserializeUserList(payload);
-            updateOnlineUsers(users);
+            m_onlineUsers = users; // 更新本地用户列表
+            updateOnlineUsers(m_onlineUsers); // 调用已声明的函数
+            QString tip = QString("当前在线用户（%1人）").arg(users.size());
+            showMessage("系统", tip);
             break;
         }
         case COMMON_MSG: {
@@ -98,39 +195,34 @@ void ChatWindow::onServerReadyRead() {
         }
         case USER_ONLINE_NOTIFY: {
             UserInfo user = deserializeUserInfo(payload);
-            m_onlineUsers[user.userId] = user;
-            updateOnlineUsers(m_onlineUsers);
-            showMessage("系统通知", QString("%1（ID：%2）已上线").arg(QString::fromStdString(user.nickname)).arg(user.userId));
+            m_onlineUsers[user.userId] = user; // 新增在线用户（m_onlineUsers已声明）
+            updateOnlineUsers(m_onlineUsers);   // 刷新UI
+            showMessage("系统", QString("用户「%1」上线了").arg(QString::fromStdString(user.nickname)));
             break;
         }
         case USER_OFFLINE_NOTIFY: {
-            int userId = *(int*)payload.data();
-            // 修复：string → std::string
-            std::string nickname(payload.begin() + sizeof(int), payload.end());
-            m_onlineUsers.erase(userId);
-            updateOnlineUsers(m_onlineUsers);
-            showMessage("系统通知", QString("%1（ID：%2）已下线").arg(QString::fromStdString(nickname)).arg(userId));
+            UserInfo user = deserializeUserInfo(payload);
+            m_onlineUsers.erase(user.userId); // 移除离线用户（m_onlineUsers已声明）
+            updateOnlineUsers(m_onlineUsers); // 刷新UI
+            showMessage("系统", QString("用户「%1」下线了").arg(QString::fromStdString(user.nickname)));
             break;
         }
         default:
+            showMessage("系统", "收到未知消息类型");
             break;
     }
 }
 
-// 新增：处理UDP接收的点对点消息
+// 接收UDP点对点消息（已有实现，保持不变）
 void ChatWindow::onUdpReadyRead() {
     QByteArray datagram;
     datagram.resize(m_udpSocket->pendingDatagramSize());
     QHostAddress senderAddr;
     quint16 senderPort;
 
-    // 读取UDP数据报
     qint64 len = m_udpSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
-    if (len <= 0) {
-        return;
-    }
+    if (len <= 0) return;
 
-    // 解析点对点消息（假设是CommonMsg格式，可根据实际协议调整）
     try {
         CommonMsg msg = deserializeCommonMsg(std::vector<char>(datagram.begin(), datagram.end()));
         showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
@@ -139,55 +231,10 @@ void ChatWindow::onUdpReadyRead() {
     }
 }
 
-void ChatWindow::onSendClicked() {
-    QString content = m_msgInput->text().trimmed();
-    if (content.isEmpty() || m_selectedUserId == -1) {
-        return;
-    }
-
-    CommonMsg msg;
-    msg.fromUserId = m_userId;
-    msg.toUserId = m_selectedUserId; // 修复：彻底删除to_user_id，只用toUserId
-    msg.fromNickname = m_nickname.toStdString();
-    msg.content = content.toStdString();
-
-    // 修复：vector → std::vector
-    std::vector<char> msgData;
-    auto nicknameData = serializeString(msg.fromNickname);
-    auto contentData = serializeString(msg.content);
-    msgData.insert(msgData.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
-    msgData.insert(msgData.end(), (char*)&msg.toUserId, (char*)&msg.toUserId + sizeof(int)); // 修复：toUserId
-    msgData.insert(msgData.end(), nicknameData.begin(), nicknameData.end());
-    msgData.insert(msgData.end(), contentData.begin(), contentData.end());
-
-    sendPacket(m_serverSocket, COMMON_MSG, msgData);
-    showMessage("我", content);
-    m_msgInput->clear();
-}
-
-void ChatWindow::onTextEdited() {
-    m_sendBtn->setEnabled(!m_msgInput->text().trimmed().isEmpty() && m_selectedUserId != -1);
-}
-
-void ChatWindow::onUserSelected(QListWidgetItem *item) {
-    m_selectedUserId = item->data(Qt::UserRole).toInt();
-    if (m_selectedUserId == m_userId) {
-        m_selectedUserId = -1;
-        QMessageBox::warning(this, "警告", "不能选择自己发送消息！");
-        return;
-    }
-    m_sendBtn->setEnabled(!m_msgInput->text().trimmed().isEmpty());
-}
-
-void ChatWindow::keyPressEvent(QKeyEvent *event) {
-    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
-        if (event->modifiers() & Qt::ControlModifier) {
-            m_msgInput->insert("\n");
-        } else {
-            onSendClicked();
-        }
-        event->accept();
-    } else {
-        QWidget::keyPressEvent(event);
-    }
+// 显示消息（已有实现，保持不变）
+void ChatWindow::showMessage(const QString &sender, const QString &content) {
+    QString time = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+    QString msg = QString("[%1] %2：%3").arg(time).arg(sender).arg(content);
+    m_chatList->addItem(msg);
+    m_chatList->scrollToBottom(); // 自动滚动到最新消息
 }

@@ -51,6 +51,7 @@ struct UserInfo {
     uint16_t dataPort;
     std::string ip;
     int managePort;
+    std::chrono::system_clock::time_point lastHeartbeatTime; 
 };
 
 struct CommonMsg {

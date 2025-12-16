@@ -11,34 +11,39 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
-#include <chrono>   // 新增：心跳时间戳
+#include <chrono>
+#include <stdexcept>
+#include <atomic>
 #include "protocol_base.h"
 
 // 全局变量定义
-std::map<int, UserInfo> gOnlineUsers;  // 键：clientFd 或 userId（保持统一）
+std::map<int, UserInfo> gOnlineUsers;  // 键：userId（统一用用户ID作为键）
 std::mutex gMutex;                     // 线程安全锁
 
-// 函数声明（放在所有函数之前）
+// 函数声明
 void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg);
 void broadcastPacket(uint32_t msgType, const std::vector<char>& data, int excludeFd);
 void handleLoginReq(int clientFd, const std::vector<char>& data);
 void handleHeartbeat(int clientFd);
+void handleCommonMsg(int clientFd, const std::vector<char>& data); // 补充声明
 void heartbeatCheckThread();
 bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data);
+void updateUserHeartbeat(int userId); // 新增：更新用户心跳时间戳
+int getUserIdByManagePort(int managePort); // 新增：通过managePort获取userId
 
-// 修复广播函数（managePort → dataPort/managePort）
-void broadcastPacket(MsgType msgType, const std::vector<char>& data, int excludeFd) {
+// 广播数据包（参数类型统一为uint32_t，匹配PacketHeader的msgType）
+void broadcastPacket(uint32_t msgType, const std::vector<char>& data, int excludeFd) {
     std::lock_guard<std::mutex> lock(gMutex);
     for (const auto& pair : gOnlineUsers) {
-        int fd = pair.second.managePort;
-        if (fd == excludeFd) continue; // 排除自身
-        if (!sendPacket(fd, msgType, data)) {
-            std::cerr << "广播数据包到fd " << fd << " 失败" << std::endl;
+        int targetFd = pair.second.managePort;
+        if (targetFd == excludeFd) continue; // 排除发送者
+        if (!sendPacket(targetFd, msgType, data)) {
+            std::cerr << "广播数据包到fd=" << targetFd << " 失败" << std::endl;
         }
     }
 }
 
-// 修复登录请求处理函数
+// 处理登录请求（修复心跳时间戳初始化）
 void handleLoginReq(int clientFd, const std::vector<char>& data) {
     try {
         LoginReq req = deserializeLoginReq(data);
@@ -47,26 +52,31 @@ void handleLoginReq(int clientFd, const std::vector<char>& data) {
             return;
         }
 
-        // 分配用户ID（示例逻辑）
-        static int gNextUserId = 1;
+        // 分配用户ID（原子递增，避免多线程冲突）
+        static std::atomic<int> gNextUserId(1);
         int userId = gNextUserId++;
         
-        // 构造UserInfo
+        // 构造用户信息（初始化心跳时间戳）
         UserInfo user;
         user.userId = userId;
         user.nickname = req.nickname;
         user.avatar = req.avatar;
         user.dataPort = req.dataPort;
-        user.managePort = clientFd; // 示例：管理端口为客户端fd
-        
-        // 加入在线用户列表
-        std::lock_guard<std::mutex> lock(gMutex);
-        gOnlineUsers[userId] = user;
-        
+        user.managePort = clientFd;
+        user.ip = "127.0.0.1"; // 实际场景需从clientAddr获取
+        user.lastHeartbeatTime = std::chrono::system_clock::now(); // 初始化心跳时间
+
+        // 加入在线用户列表（线程安全）
+        {
+            std::lock_guard<std::mutex> lock(gMutex);
+            gOnlineUsers[userId] = user;
+        }
+
         // 发送登录成功响应
         sendLoginRsp(clientFd, true, userId, "登录成功");
-        
-        // 广播用户上线通知（现在serializeUserInfo已修复）
+        std::cout << "用户登录：userId=" << userId << "，nickname=" << req.nickname << "，fd=" << clientFd << std::endl;
+
+        // 广播用户上线通知
         std::vector<char> notifyData = serializeUserInfo(user);
         broadcastPacket(USER_ONLINE_NOTIFY, notifyData, clientFd);
         
@@ -76,60 +86,134 @@ void handleLoginReq(int clientFd, const std::vector<char>& data) {
     }
 }
 
-// 修复心跳处理函数
+// 处理心跳包（更新心跳时间戳）
 void handleHeartbeat(int clientFd) {
+    int userId = getUserIdByManagePort(clientFd);
+    if (userId == -1) {
+        std::cerr << "心跳包来自未知客户端：fd=" << clientFd << std::endl;
+        return;
+    }
+
+    // 更新心跳时间戳（线程安全）
+    updateUserHeartbeat(userId);
+    std::cout << "收到心跳：userId=" << userId << "，fd=" << clientFd << std::endl;
+
+    // 回复心跳响应
     std::vector<char> emptyData;
-    sendPacket(clientFd, HEARTBEAT, emptyData); // 回复心跳包
+    if (!sendPacket(clientFd, HEARTBEAT, emptyData)) {
+        std::cerr << "回复心跳包失败：fd=" << clientFd << std::endl;
+    }
 }
 
-// 修复心跳检测线程
+// 处理普通消息（核心修复：转发消息，解决发送闪退）
+void handleCommonMsg(int clientFd, const std::vector<char>& data) {
+    try {
+        int senderUserId = getUserIdByManagePort(clientFd);
+        if (senderUserId == -1) {
+            std::cerr << "普通消息来自未知客户端：fd=" << clientFd << std::endl;
+            return;
+        }
+
+        // 解析消息内容
+        CommonMsg msg = deserializeCommonMsg(data);
+        msg.fromUserId = senderUserId; // 确保发送者ID正确
+        msg.fromNickname = gOnlineUsers[senderUserId].nickname;
+
+        // 序列化转发的消息
+        std::vector<char> forwardData = serializeCommonMsg(msg);
+
+        // 广播消息（排除发送者自身）
+        broadcastPacket(COMMON_MSG, forwardData, clientFd);
+        std::cout << "转发消息：fromUserId=" << senderUserId << "，content=" << msg.content.substr(0, 20) << "..." << std::endl;
+
+        // 更新发送者心跳时间戳
+        updateUserHeartbeat(senderUserId);
+    } catch (const std::exception& e) {
+        std::cerr << "处理普通消息失败：" << e.what() << std::endl;
+    }
+}
+
+// 心跳检测线程（修复：基于时间戳判断超时，默认60秒超时）
 void heartbeatCheckThread() {
+    const int TIMEOUT_SECONDS = 60; // 超时时间：60秒
     while (true) {
-        sleep(30); // 30秒检测一次
-        std::lock_guard<std::mutex> lock(gMutex);
-        // 示例逻辑：检测超时连接，广播下线通知
-        for (auto it = gOnlineUsers.begin(); it != gOnlineUsers.end(); ) {
-            // 假设检测逻辑...
-            bool offline = true; // 示例：标记为下线
-            if (offline) {
-                UserInfo user = it->second;
-                std::vector<char> notifyData = serializeUserInfo(user);
-                broadcastPacket(USER_OFFLINE_NOTIFY, notifyData, user.managePort);
-                it = gOnlineUsers.erase(it);
-            } else {
-                ++it;
+        std::this_thread::sleep_for(std::chrono::seconds(30)); // 每30秒检测一次
+        std::vector<int> offlineUserIds; // 存储离线用户ID
+
+        // 1. 检测超时用户
+        {
+            std::lock_guard<std::mutex> lock(gMutex);
+            auto now = std::chrono::system_clock::now();
+            for (const auto& pair : gOnlineUsers) {
+                int userId = pair.first;
+                const auto& user = pair.second;
+                // 计算时间差
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - user.lastHeartbeatTime);
+                if (duration.count() > TIMEOUT_SECONDS) {
+                    offlineUserIds.push_back(userId);
+                    std::cout << "用户超时离线：userId=" << userId << "，nickname=" << user.nickname << std::endl;
+                }
             }
+        }
+
+        // 2. 处理离线用户（广播通知+移除列表）
+        for (int userId : offlineUserIds) {
+            UserInfo offlineUser;
+            {
+                std::lock_guard<std::mutex> lock(gMutex);
+                auto it = gOnlineUsers.find(userId);
+                if (it == gOnlineUsers.end()) continue;
+                offlineUser = it->second;
+                gOnlineUsers.erase(it); // 从在线列表移除
+            }
+
+            // 广播下线通知
+            std::vector<char> notifyData = serializeUserInfo(offlineUser);
+            broadcastPacket(USER_OFFLINE_NOTIFY, notifyData, offlineUser.managePort);
+
+            // 关闭客户端连接（若未关闭）
+            close(offlineUser.managePort);
+            std::cout << "已清理离线用户资源：userId=" << userId << "，fd=" << offlineUser.managePort << std::endl;
         }
     }
 }
 
-// 补全sendLoginRsp函数（发送登录响应）
+// 发送登录响应
 void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg) {
-    LoginRsp rsp;
-    rsp.success = success;
-    rsp.userId = userId;
-    rsp.msg = msg;
-    rsp.nickname = success ? gOnlineUsers[userId].nickname : "";
-    
-    // 序列化响应
-    std::vector<char> rspData = serializeLoginRsp(rsp);
-    // 发送响应
-    sendPacket(clientFd, LOGIN_RSP, rspData);
+    try {
+        LoginRsp rsp;
+        rsp.success = success;
+        rsp.userId = userId;
+        rsp.msg = msg;
+        rsp.nickname = success ? gOnlineUsers[userId].nickname : "";
+
+        // 序列化响应
+        std::vector<char> rspData = serializeLoginRsp(rsp);
+        // 发送响应（检查socket状态）
+        if (!sendPacket(clientFd, LOGIN_RSP, rspData)) {
+            std::cerr << "发送登录响应失败：fd=" << clientFd << "，success=" << success << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "序列化登录响应失败：" << e.what() << std::endl;
+    }
 }
 
-// server.cpp 新增：完整读取数据包函数
+// 完整读取数据包（确保不截断）
 bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data) {
-    // 读取头部
+    // 读取头部（必须完整读取sizeof(PacketHeader)字节）
     ssize_t ret = recv(fd, &header, sizeof(PacketHeader), 0);
     if (ret == -1) {
         perror("recv header failed");
         return false;
+    } else if (ret == 0) {
+        std::cerr << "客户端断开连接：fd=" << fd << "（读取头部时）" << std::endl;
+        return false;
     } else if (ret != sizeof(PacketHeader)) {
-        std::cerr << "recv header incomplete" << std::endl;
+        std::cerr << "头部读取不完整：fd=" << fd << "，实际读取=" << ret << "，需要=" << sizeof(PacketHeader) << std::endl;
         return false;
     }
 
-    // 读取数据
+    // 读取数据部分（按header.dataLen读取完整）
     data.resize(header.dataLen);
     size_t recved = 0;
     while (recved < header.dataLen) {
@@ -138,12 +222,32 @@ bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data) {
             perror("recv data failed");
             return false;
         } else if (ret == 0) {
-            std::cerr << "connection closed" << std::endl;
+            std::cerr << "客户端断开连接：fd=" << fd << "（读取数据时）" << std::endl;
             return false;
         }
         recved += ret;
     }
     return true;
+}
+
+// 更新用户心跳时间戳（线程安全）
+void updateUserHeartbeat(int userId) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    auto it = gOnlineUsers.find(userId);
+    if (it != gOnlineUsers.end()) {
+        it->second.lastHeartbeatTime = std::chrono::system_clock::now();
+    }
+}
+
+// 通过managePort获取userId（线程安全）
+int getUserIdByManagePort(int managePort) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    for (const auto& pair : gOnlineUsers) {
+        if (pair.second.managePort == managePort) {
+            return pair.first;
+        }
+    }
+    return -1; // 未找到
 }
 
 // 服务端主函数（程序入口）
@@ -155,7 +259,7 @@ int main() {
         return 1;
     }
 
-    // 2. 设置端口复用（避免服务器重启时端口占用）
+    // 2. 设置端口复用（避免重启时端口占用）
     int opt = 1;
     if (setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
         std::cerr << "setsockopt失败：" << strerror(errno) << std::endl;
@@ -163,7 +267,7 @@ int main() {
         return 1;
     }
 
-    // 3. 绑定端口（例如 8888）
+    // 3. 绑定端口（8888）
     sockaddr_in serverAddr;
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
@@ -176,7 +280,7 @@ int main() {
         return 1;
     }
 
-    // 4. 开始监听（最大等待队列长度 10）
+    // 4. 开始监听（最大等待队列10）
     if (listen(listenFd, 10) == -1) {
         std::cerr << "监听失败：" << strerror(errno) << std::endl;
         close(listenFd);
@@ -189,7 +293,7 @@ int main() {
     std::thread heartbeatThread(heartbeatCheckThread);
     heartbeatThread.detach(); // 后台运行
 
-    // 6. 使用epoll处理多客户端连接（事件循环）
+    // 6. 初始化epoll（处理多客户端）
     int epollFd = epoll_create1(0);
     if (epollFd == -1) {
         std::cerr << "epoll_create失败：" << strerror(errno) << std::endl;
@@ -202,7 +306,7 @@ int main() {
     ev.events = EPOLLIN; // 监听读事件
     ev.data.fd = listenFd;
     if (epoll_ctl(epollFd, EPOLL_CTL_ADD, listenFd, &ev) == -1) {
-        std::cerr << "epoll_ctl添加监听Socket失败：" << strerror(errno) << std::endl;
+        std::cerr << "epoll添加监听Socket失败：" << strerror(errno) << std::endl;
         close(epollFd);
         close(listenFd);
         return 1;
@@ -211,7 +315,7 @@ int main() {
     const int MAX_EVENTS = 10;
     struct epoll_event events[MAX_EVENTS];
 
-    // 7. 事件循环（处理新连接和客户端数据）
+    // 7. 事件循环（核心修复：使用recvCompletePacket读取完整数据包）
     while (true) {
         int nfds = epoll_wait(epollFd, events, MAX_EVENTS, -1); // 阻塞等待事件
         if (nfds == -1) {
@@ -230,56 +334,67 @@ int main() {
                     continue;
                 }
 
-                // 设置客户端Socket为非阻塞
-                fcntl(clientFd, F_SETFL, O_NONBLOCK);
+                // 设置客户端Socket为非阻塞（适配边缘触发）
+                int flags = fcntl(clientFd, F_GETFL, 0);
+                if (fcntl(clientFd, F_SETFL, flags | O_NONBLOCK) == -1) {
+                    std::cerr << "设置非阻塞失败：fd=" << clientFd << std::endl;
+                    close(clientFd);
+                    continue;
+                }
 
-                // 添加客户端Socket到epoll
-                ev.events = EPOLLIN | EPOLLET; // 边缘触发（高效处理）
+                // 添加客户端Socket到epoll（边缘触发+ET模式）
+                ev.events = EPOLLIN | EPOLLET;
                 ev.data.fd = clientFd;
                 if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &ev) == -1) {
-                    std::cerr << "epoll_ctl添加客户端Socket失败：" << strerror(errno) << std::endl;
+                    std::cerr << "epoll添加客户端失败：fd=" << clientFd << std::endl;
                     close(clientFd);
+                    continue;
                 }
 
                 std::cout << "新客户端连接：fd=" << clientFd 
-                          << "，IP=" << inet_ntoa(clientAddr.sin_addr) << std::endl;
+                          << "，IP=" << inet_ntoa(clientAddr.sin_addr) 
+                          << "，端口=" << ntohs(clientAddr.sin_port) << std::endl;
 
             } else {
-                // 处理客户端数据（简化版：实际需读取完整数据包）
+                // 处理客户端数据（核心修复：使用recvCompletePacket读取完整数据包）
                 int clientFd = events[i].data.fd;
-                char buf[1024];
-                ssize_t n = read(clientFd, buf, sizeof(buf));
+                PacketHeader header;
+                std::vector<char> payload;
 
-                if (n <= 0) {
-                    // 连接关闭或错误，移除客户端
-                    std::cout << "客户端断开连接：fd=" << clientFd << std::endl;
+                // 读取完整数据包
+                if (!recvCompletePacket(clientFd, header, payload)) {
+                    // 读取失败，清理资源
+                    std::cerr << "清理异常客户端：fd=" << clientFd << std::endl;
                     epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
                     close(clientFd);
-                    // 从在线用户列表移除（需根据实际逻辑调整）
-                    std::lock_guard<std::mutex> lock(gMutex);
-                    for (auto it = gOnlineUsers.begin(); it != gOnlineUsers.end(); ++it) {
-                        if (it->second.managePort == clientFd) {
-                            gOnlineUsers.erase(it);
-                            break;
-                        }
-                    }
-                } else {
-                    // 解析数据包（此处简化，实际需根据协议解析msgType并调用对应处理函数）
-                    PacketHeader* header = reinterpret_cast<PacketHeader*>(buf);
-                    std::vector<char> payload(buf + sizeof(PacketHeader), buf + n);
 
-                    switch (header->msgType) {
-                        case LOGIN_REQ:
-                            handleLoginReq(clientFd, payload);
-                            break;
-                        case HEARTBEAT:
-                            handleHeartbeat(clientFd);
-                            break;
-                        // 其他消息类型（如COMMON_MSG）的处理逻辑
-                        default:
-                            std::cout << "收到未知消息类型：" << header->msgType << std::endl;
-                            break;
+                    // 从在线列表移除
+                    int userId = getUserIdByManagePort(clientFd);
+                    if (userId != -1) {
+                        std::lock_guard<std::mutex> lock(gMutex);
+                        gOnlineUsers.erase(userId);
+                        // 广播下线通知
+                        UserInfo offlineUser = gOnlineUsers[userId];
+                        std::vector<char> notifyData = serializeUserInfo(offlineUser);
+                        broadcastPacket(USER_OFFLINE_NOTIFY, notifyData, clientFd);
                     }
+                    continue;
+                }
+
+                // 分发消息到对应处理函数
+                switch (header.msgType) {
+                    case LOGIN_REQ:
+                        handleLoginReq(clientFd, payload);
+                        break;
+                    case HEARTBEAT:
+                        handleHeartbeat(clientFd);
+                        break;
+                    case COMMON_MSG:
+                        handleCommonMsg(clientFd, payload); // 新增：处理普通消息
+                        break;
+                    default:
+                        std::cout << "收到未知消息类型：" << header.msgType << "，fd=" << clientFd << std::endl;
+                        break;
                 }
             }
         }
@@ -288,5 +403,6 @@ int main() {
     // 清理资源
     close(epollFd);
     close(listenFd);
+    std::cout << "服务端退出" << std::endl;
     return 0;
 }
