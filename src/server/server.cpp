@@ -250,6 +250,25 @@ int getUserIdByManagePort(int managePort) {
     return -1; // 未找到
 }
 
+std::vector<char> serializeUserList(const std::map<int, UserInfo>& users) {
+    std::vector<char> data;
+    // 先写入用户数量
+    int userCount = users.size();
+    data.insert(data.end(), (char*)&userCount, (char*)&userCount + sizeof(int));
+    
+    // 逐个序列化用户信息
+    for (const auto& [userId, user] : users) {
+        // 序列化UserInfo（需与客户端deserializeUserList对应）
+        data.insert(data.end(), (char*)&user.userId, (char*)&user.userId + sizeof(int));
+        
+        auto nicknameData = serializeString(user.nickname);
+        data.insert(data.end(), nicknameData.begin(), nicknameData.end());
+        
+        data.insert(data.end(), (char*)&user.dataPort, (char*)&user.dataPort + sizeof(uint16_t));
+    }
+    return data;
+}
+
 // 服务端主函数（程序入口）
 int main() {
     // 1. 创建监听Socket
@@ -395,6 +414,15 @@ int main() {
                     default:
                         std::cout << "收到未知消息类型：" << header.msgType << "，fd=" << clientFd << std::endl;
                         break;
+                    case USER_LIST_REQ: {
+                        std::lock_guard<std::mutex> lock(gMutex);
+                         // 序列化在线用户列表（需实现serializeUserList函数）
+                        std::vector<char> userListData = serializeUserList(gOnlineUsers);
+                        // 发送用户列表响应
+                        sendPacket(clientFd, USER_LIST_RSP, userListData);
+                        std::cout << "已响应客户端 " << clientFd << " 的用户列表请求" << std::endl;
+                        break;
+                    }
                 }
             }
         }

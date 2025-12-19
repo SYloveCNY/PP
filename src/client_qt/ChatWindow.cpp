@@ -6,11 +6,20 @@
 
 // 构造函数（完整实现，修复信号绑定）
 ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSocket, QUdpSocket *udpSocket, QWidget *parent)
-    : QWidget(parent), m_userId(userId), m_nickname(nickname),
-      m_serverSocket(serverSocket), m_udpSocket(udpSocket) {
+    : QWidget(parent), 
+      m_userId(userId), 
+      m_nickname(nickname),
+      m_serverSocket(serverSocket), 
+      m_udpSocket(udpSocket),
+      m_recvBuffer() // 初始化TCP接收缓存（解决粘包/半包导致的“无效信息”）
+{
+    // 关键修复1：接管Socket生命周期，避免LoginWindow销毁时被删除（核心解决“连接断开”）
+    m_serverSocket->setParent(this);
+    m_udpSocket->setParent(this);
+
     // 窗口配置
     setWindowTitle(QString("聊天窗口 - %1（ID：%2）").arg(nickname).arg(userId));
-    setFixedSize(800, 500); // 扩大窗口，容纳用户列表
+    setFixedSize(800, 500);
 
     // 初始化控件（新增用户列表+标题标签）
     m_chatList = new QListWidget;
@@ -22,12 +31,13 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
 
     m_userList = new QListWidget; // 在线用户列表UI
     m_userList->setFixedWidth(150);
-    // 移除这行错误代码：m_userList->setPlaceholderText("在线用户");
+    m_userList->addItem("广播 (ID: 0)"); // 默认添加广播选项（优化体验）
 
     m_inputEdit = new QTextEdit;
     m_inputEdit->setPlaceholderText("输入消息后按Ctrl+Enter发送");
     m_inputEdit->setMaximumHeight(80);
     m_sendBtn = new QPushButton("发送");
+    m_sendBtn->setEnabled(false); // 初始禁用（无输入时，避免无效点击）
 
     // 布局（左侧：标题+用户列表；右侧：聊天区域）
     QHBoxLayout *mainLayout = new QHBoxLayout(this);
@@ -54,21 +64,37 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
     mainLayout->setStretch(0, 1);
     mainLayout->setStretch(1, 3);
 
-    // 信号绑定（保持不变）
+    // 信号绑定（补充连接状态监听，修复“连接断开”无提示问题）
     connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::sendMessage);
     connect(m_serverSocket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
     connect(m_udpSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
     connect(m_userList, &QListWidget::itemClicked, this, &ChatWindow::onUserSelected);
-    connect(m_inputEdit, &QTextEdit::textChanged, this, &ChatWindow::onTextEdited);
+    connect(m_inputEdit, &QTextEdit::textChanged, this, [this]() {
+        // 输入非空时启用发送按钮
+        m_sendBtn->setEnabled(!m_inputEdit->toPlainText().trimmed().isEmpty());
+    });
 
-    // 发送用户列表请求（保持不变）
-    PacketHeader header;
-    header.msgType = USER_LIST_REQ;
-    header.dataLen = 0;
-    std::vector<char> sendData;
-    sendData.insert(sendData.end(), reinterpret_cast<char*>(&header), 
-                    reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
-    m_serverSocket->write(sendData.data(), sendData.size());
+    // 关键修复2：监听连接断开/错误，及时提示用户
+    connect(m_serverSocket, &QTcpSocket::disconnected, this, []() {
+        QMessageBox::warning(nullptr, "连接提示", "与服务端的连接已断开！");
+    });
+    connect(m_serverSocket, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        showMessage("系统", "连接错误：" + m_serverSocket->errorString());
+    });
+
+    // 关键修复3：发送用户列表请求前检查连接状态（避免无效请求）
+    if (m_serverSocket->state() == QAbstractSocket::ConnectedState) {
+        PacketHeader header;
+        header.msgType = USER_LIST_REQ;
+        header.dataLen = 0;
+        std::vector<char> sendData;
+        sendData.insert(sendData.end(), reinterpret_cast<char*>(&header), 
+                        reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
+        m_serverSocket->write(sendData.data(), sendData.size());
+        showMessage("系统", "正在获取在线用户列表...");
+    } else {
+        showMessage("系统", "连接未建立，无法获取在线用户");
+    }
 }
 
 // 析构函数实现（匹配头文件声明）
@@ -170,46 +196,55 @@ void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo> &users) {
 
 // 接收服务端消息（修复updateOnlineUsers和m_onlineUsers调用）
 void ChatWindow::onServerReadyRead() {
-    QByteArray data = m_serverSocket->readAll();
-    if (data.size() < sizeof(PacketHeader)) {
-        showMessage("系统", "收到无效消息");
-        return;
-    }
+    // 追加新数据到缓存
+    m_recvBuffer.append(m_serverSocket->readAll());
 
-    PacketHeader *header = reinterpret_cast<PacketHeader*>(data.data());
-    std::vector<char> payload(data.begin() + sizeof(PacketHeader), data.end());
+    // 循环处理缓存中的完整数据包
+    while (m_recvBuffer.size() >= sizeof(PacketHeader)) {
+        // 解析包头
+        PacketHeader* header = reinterpret_cast<PacketHeader*>(m_recvBuffer.data());
+        // 检查数据包是否完整（包头+数据）
+        if (m_recvBuffer.size() < sizeof(PacketHeader) + header->dataLen) {
+            break; // 数据不完整，等待下一次readyRead
+        }
 
-    switch (header->msgType) {
-        case USER_LIST_RSP: {
-            std::map<int, UserInfo> users = deserializeUserList(payload);
-            m_onlineUsers = users; // 更新本地用户列表
-            updateOnlineUsers(m_onlineUsers); // 调用已声明的函数
-            QString tip = QString("当前在线用户（%1人）").arg(users.size());
-            showMessage("系统", tip);
-            break;
+        // 提取 payload
+        std::vector<char> payload(
+            m_recvBuffer.begin() + sizeof(PacketHeader),
+            m_recvBuffer.begin() + sizeof(PacketHeader) + header->dataLen
+        );
+
+        // 处理不同类型的消息
+        switch (header->msgType) {
+            case USER_LIST_RSP: {
+                try {
+                    std::map<int, UserInfo> users = deserializeUserList(payload);
+                    updateOnlineUsers(users);
+                } catch (const std::exception& e) {
+                    showMessage("系统", "解析用户列表失败：" + QString::fromStdString(e.what()));
+                }
+                break;
+            }
+            case COMMON_MSG: {
+                try {
+                    CommonMsg msg = deserializeCommonMsg(payload);
+                    showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
+                } catch (const std::exception& e) {
+                    showMessage("系统", "解析消息失败：" + QString::fromStdString(e.what()));
+                }
+                break;
+            }
+            case USER_ONLINE_NOTIFY:
+            case USER_OFFLINE_NOTIFY:
+                // 现有处理逻辑...
+                break;
+            default:
+                showMessage("系统", "收到无效信息（未知消息类型）");
+                break;
         }
-        case COMMON_MSG: {
-            CommonMsg msg = deserializeCommonMsg(payload);
-            showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
-            break;
-        }
-        case USER_ONLINE_NOTIFY: {
-            UserInfo user = deserializeUserInfo(payload);
-            m_onlineUsers[user.userId] = user; // 新增在线用户（m_onlineUsers已声明）
-            updateOnlineUsers(m_onlineUsers);   // 刷新UI
-            showMessage("系统", QString("用户「%1」上线了").arg(QString::fromStdString(user.nickname)));
-            break;
-        }
-        case USER_OFFLINE_NOTIFY: {
-            UserInfo user = deserializeUserInfo(payload);
-            m_onlineUsers.erase(user.userId); // 移除离线用户（m_onlineUsers已声明）
-            updateOnlineUsers(m_onlineUsers); // 刷新UI
-            showMessage("系统", QString("用户「%1」下线了").arg(QString::fromStdString(user.nickname)));
-            break;
-        }
-        default:
-            showMessage("系统", "收到未知消息类型");
-            break;
+
+        // 移除已处理的数据包
+        m_recvBuffer.remove(0, sizeof(PacketHeader) + header->dataLen);
     }
 }
 

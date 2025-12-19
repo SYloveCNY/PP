@@ -48,6 +48,7 @@ private:
     QTextEdit *m_inputEdit;     // 消息输入框
     QPushButton *m_sendBtn;     // 发送按钮
     QListWidget *m_userList;    // 新增：在线用户列表UI控件
+    QByteArray m_recvBuffer;    // 新增：缓存接收的数据
     std::map<int, UserInfo> m_onlineUsers; // 新增：存储在线用户（解决未声明错误）
 };
 

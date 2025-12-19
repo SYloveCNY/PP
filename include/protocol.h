@@ -299,18 +299,15 @@ inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data
 // ========== CommonMsg序列化/反序列化（客户端聊天消息） ==========
 inline std::vector<char> serializeCommonMsg(const CommonMsg& msg) {
     std::vector<char> data;
-    // 序列化fromUserId
-    data.insert(data.end(), reinterpret_cast<const char*>(&msg.fromUserId),
-                reinterpret_cast<const char*>(&msg.fromUserId) + sizeof(int));
-    // 序列化fromNickname
+    // 严格按照：fromUserId → toUserId → fromNickname → content 的顺序序列化
+    data.insert(data.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
+    data.insert(data.end(), (char*)&msg.toUserId, (char*)&msg.toUserId + sizeof(int));
+    
     auto nicknameData = serializeString(msg.fromNickname);
     data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    // 序列化content
+    
     auto contentData = serializeString(msg.content);
     data.insert(data.end(), contentData.begin(), contentData.end());
-    // 序列化toUserId
-    data.insert(data.end(), reinterpret_cast<const char*>(&msg.toUserId),
-                reinterpret_cast<const char*>(&msg.toUserId) + sizeof(int));
     return data;
 }
 

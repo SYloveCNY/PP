@@ -136,9 +136,13 @@ void LoginWindow::onReadyRead() {
         LoginRsp rsp = deserializeLoginRsp(std::vector<char>(data.begin() + sizeof(PacketHeader), data.end()));
         if (rsp.success) {
             QMessageBox::information(this, "成功", QString("登录成功！用户ID：%1").arg(rsp.userId));
-            // 正确传递4个参数（含 udpSocket）
+            
+            // 关键修复：解除socket与LoginWindow的关联，避免被销毁
+            serverSocket->setParent(nullptr);
+            udpSocket->setParent(nullptr);
+            
             emit loginSuccess(rsp.userId, QString::fromStdString(rsp.nickname), serverSocket, udpSocket);
-            this->close();
+            this->close(); // 此时LoginWindow销毁不会影响socket
         } else {
             QMessageBox::critical(this, "失败", QString("登录失败：%1").arg(QString::fromStdString(rsp.msg)));
             loginBtn->setText("登录");
