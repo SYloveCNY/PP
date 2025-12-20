@@ -252,19 +252,16 @@ int getUserIdByManagePort(int managePort) {
 
 std::vector<char> serializeUserList(const std::map<int, UserInfo>& users) {
     std::vector<char> data;
-    // 先写入用户数量
-    int userCount = users.size();
-    data.insert(data.end(), (char*)&userCount, (char*)&userCount + sizeof(int));
+    // 1. 序列化用户数量（注意网络字节序转换，与客户端deserializeUserList对应）
+    uint32_t userCount = static_cast<uint32_t>(users.size());
+    uint32_t networkCount = htonl(userCount); // 转为网络字节序
+    data.insert(data.end(), reinterpret_cast<char*>(&networkCount), 
+                reinterpret_cast<char*>(&networkCount) + sizeof(uint32_t));
     
-    // 逐个序列化用户信息
+    // 2. 逐个序列化用户信息（调用serializeUserInfo，需确保该函数已实现）
     for (const auto& [userId, user] : users) {
-        // 序列化UserInfo（需与客户端deserializeUserList对应）
-        data.insert(data.end(), (char*)&user.userId, (char*)&user.userId + sizeof(int));
-        
-        auto nicknameData = serializeString(user.nickname);
-        data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-        
-        data.insert(data.end(), (char*)&user.dataPort, (char*)&user.dataPort + sizeof(uint16_t));
+        std::vector<char> userData = serializeUserInfo(user);
+        data.insert(data.end(), userData.begin(), userData.end());
     }
     return data;
 }
@@ -411,18 +408,19 @@ int main() {
                     case COMMON_MSG:
                         handleCommonMsg(clientFd, payload); // 新增：处理普通消息
                         break;
-                    default:
-                        std::cout << "收到未知消息类型：" << header.msgType << "，fd=" << clientFd << std::endl;
-                        break;
                     case USER_LIST_REQ: {
                         std::lock_guard<std::mutex> lock(gMutex);
-                         // 序列化在线用户列表（需实现serializeUserList函数）
+                        std::cout << "准备发送用户列表给fd=" << clientFd << "，在线用户数：" << gOnlineUsers.size() << std::endl;
+                        // 序列化在线用户列表（需实现serializeUserList函数）
                         std::vector<char> userListData = serializeUserList(gOnlineUsers);
                         // 发送用户列表响应
                         sendPacket(clientFd, USER_LIST_RSP, userListData);
                         std::cout << "已响应客户端 " << clientFd << " 的用户列表请求" << std::endl;
                         break;
                     }
+                    default:
+                        std::cout << "收到未知消息类型：" << header.msgType << "，fd=" << clientFd << std::endl;
+                        break;
                 }
             }
         }

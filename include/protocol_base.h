@@ -264,20 +264,23 @@ inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
 }
 
 inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data) {
-    std::map<int, UserInfo> userList;
-    size_t offset = 0;
-    if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("User count field out of bounds");
+    std::map<int, UserInfo> users;
+    if (data.size() < sizeof(uint32_t)) {
+        throw std::runtime_error("用户列表数据不完整（缺少用户数量）");
     }
-    uint32_t count = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    count = ntohl(count);
-    offset += sizeof(uint32_t);
-    
-    for (uint32_t i = 0; i < count; ++i) {
+
+    // 关键修复：用ntohl转换网络字节序到主机字节序
+    uint32_t networkCount;
+    memcpy(&networkCount, data.data(), sizeof(uint32_t));
+    uint32_t userCount = ntohl(networkCount); // 对应服务端的htonl
+
+    size_t offset = sizeof(uint32_t);
+    for (uint32_t i = 0; i < userCount; ++i) {
+        // 解析单个用户信息（需确保deserializeUserInfo也处理字节序）
         UserInfo user = deserializeUserInfo(data, offset);
-        userList[user.userId] = user;
+        users[user.userId] = user;
     }
-    return userList;
+    return users;
 }
 
 inline std::vector<char> serializeCommonMsg(const CommonMsg& msg) {
