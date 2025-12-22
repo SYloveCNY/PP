@@ -7,6 +7,7 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QLabel>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QTcpSocket>
 #include <string>  // 新增

@@ -13,6 +13,7 @@
 #include <QKeyEvent>       // 新增：处理键盘事件（回车发送）
 #include <map>             // 新增：用于存储在线用户列表
 #include <QLabel> 
+#include <QTimer>
 #include "protocol_qt.h"   // 包含UserInfo、MsgType等定义
 
 class ChatWindow : public QWidget {
@@ -29,6 +30,7 @@ private slots:
     void sendMessage();         // 发送消息核心函数
     void onTextEdited();        // 新增：文本编辑框变化槽函数（声明）
     void onUserSelected(QListWidgetItem *item); // 新增：用户选择槽函数（声明）
+    void sendHeartbeat(); // 发送心跳包的槽函数
 
 private:
     // 重写键盘事件（捕捉回车发送）
@@ -50,6 +52,7 @@ private:
     QListWidget *m_userList;    // 新增：在线用户列表UI控件
     QByteArray m_recvBuffer;    // 新增：缓存接收的数据
     std::map<int, UserInfo> m_onlineUsers; // 新增：存储在线用户（解决未声明错误）
+    QTimer *m_heartbeatTimer;   // 定时发送心跳的定时器
 };
 
 #endif // CHATWINDOW_H

@@ -108,26 +108,34 @@ void handleHeartbeat(int clientFd) {
 // 处理普通消息（核心修复：转发消息，解决发送闪退）
 void handleCommonMsg(int clientFd, const std::vector<char>& data) {
     try {
-        int senderUserId = getUserIdByManagePort(clientFd);
-        if (senderUserId == -1) {
-            std::cerr << "普通消息来自未知客户端：fd=" << clientFd << std::endl;
-            return;
-        }
-
-        // 解析消息内容
         CommonMsg msg = deserializeCommonMsg(data);
-        msg.fromUserId = senderUserId; // 确保发送者ID正确
-        msg.fromNickname = gOnlineUsers[senderUserId].nickname;
+        std::cout << "转发消息：fromUserId=" << msg.fromUserId << "，content=" << msg.content.substr(0, 10) << "..." << std::endl;
 
-        // 序列化转发的消息
-        std::vector<char> forwardData = serializeCommonMsg(msg);
+        std::lock_guard<std::mutex> lock(gMutex);
+        // 遍历所有在线用户，转发消息（广播：toUserId=0）
+        for (const auto& [targetFd, targetUser] : gOnlineUsers) {
+            // 跳过发送者自己
+            if (targetFd == clientFd) continue;
 
-        // 广播消息（排除发送者自身）
-        broadcastPacket(COMMON_MSG, forwardData, clientFd);
-        std::cout << "转发消息：fromUserId=" << senderUserId << "，content=" << msg.content.substr(0, 20) << "..." << std::endl;
+            // 构造转发的数据包（复用原msg，无需修改）
+            std::vector<char> msgData = serializeCommonMsg(msg);
+            PacketHeader header;
+            header.msgType = COMMON_MSG;
+            header.dataLen = static_cast<uint32_t>(msgData.size());
 
-        // 更新发送者心跳时间戳
-        updateUserHeartbeat(senderUserId);
+            std::vector<char> sendData;
+            sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
+                            reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
+            sendData.insert(sendData.end(), msgData.begin(), msgData.end());
+
+            // 发送给目标用户
+            ssize_t sent = send(targetFd, sendData.data(), sendData.size(), 0);
+            if (sent == -1) {
+                std::cerr << "转发消息给fd=" << targetFd << "失败：" << strerror(errno) << std::endl;
+            } else {
+                std::cout << "已转发消息给fd=" << targetFd << "（" << targetUser.nickname << "）" << std::endl;
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "处理普通消息失败：" << e.what() << std::endl;
     }
@@ -402,9 +410,16 @@ int main() {
                     case LOGIN_REQ:
                         handleLoginReq(clientFd, payload);
                         break;
-                    case HEARTBEAT:
-                        handleHeartbeat(clientFd);
+                    case HEARTBEAT: {
+                        std::lock_guard<std::mutex> lock(gMutex);
+                        // 根据clientFd找到对应的用户（假设gOnlineUsers是fd→UserInfo的映射，或需维护fd与userId的关联）
+                        auto it = gOnlineUsers.find(clientFd);
+                        if (it != gOnlineUsers.end()) {
+                            it->second.lastHeartbeatTime = std::chrono::system_clock::now();
+                            std::cout << "收到fd=" << clientFd << "的心跳，更新时间" << std::endl;
+                        }
                         break;
+                    }
                     case COMMON_MSG:
                         handleCommonMsg(clientFd, payload); // 新增：处理普通消息
                         break;

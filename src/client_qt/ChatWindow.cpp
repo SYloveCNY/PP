@@ -39,6 +39,12 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
     m_sendBtn = new QPushButton("发送");
     m_sendBtn->setEnabled(false); // 初始禁用（无输入时，避免无效点击）
 
+    // 关键：初始化心跳定时器（3秒发送一次，避免服务端超时）
+    m_heartbeatTimer = new QTimer(this);
+    m_heartbeatTimer->setInterval(3000); // 3秒一次（需与服务端超时时间匹配）
+    connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatWindow::sendHeartbeat);
+    m_heartbeatTimer->start(); // 启动定时器
+
     // 布局（左侧：标题+用户列表；右侧：聊天区域）
     QHBoxLayout *mainLayout = new QHBoxLayout(this);
     QVBoxLayout *userListLayout = new QVBoxLayout; // 新增：用户列表+标题的布局
@@ -237,12 +243,8 @@ void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo>& users) {
         QString itemText = QString("%1 (ID: %2)").arg(nickname).arg(userId);
         
         // 添加到列表并验证
-        QListWidgetItem* item = m_userList->addItem(itemText);
-        if (item) {
-            qDebug() << "[updateOnlineUsers] 成功添加用户：" << itemText;
-        } else {
-            qDebug() << "[updateOnlineUsers] 添加用户失败：" << itemText;
-        }
+        m_userList->addItem(itemText);
+         qDebug() << "[updateOnlineUsers] 成功添加用户：" << itemText;
     }
 
     // 可选：默认选中“广播”选项
@@ -330,10 +332,6 @@ void ChatWindow::onServerReadyRead() {
                 }
                 break;
             }
-            case USER_ONLINE_NOTIFY:
-            case USER_OFFLINE_NOTIFY:
-                // 现有处理逻辑...
-                break;
             default:
                 showMessage("系统", "收到无效信息（未知消息类型）");
                 break;
@@ -368,4 +366,28 @@ void ChatWindow::showMessage(const QString &sender, const QString &content) {
     QString msg = QString("[%1] %2：%3").arg(time).arg(sender).arg(content);
     m_chatList->addItem(msg);
     m_chatList->scrollToBottom(); // 自动滚动到最新消息
+}
+
+// 新增：发送心跳包的实现
+void ChatWindow::sendHeartbeat() {
+    if (m_serverSocket->state() != QAbstractSocket::ConnectedState) {
+        qDebug() << "[心跳] 连接已断开，跳过发送";
+        return;
+    }
+
+    // 构造心跳数据包（无payload，仅包头）
+    PacketHeader header;
+    header.msgType = HEARTBEAT;
+    header.dataLen = 0;
+
+    std::vector<char> sendData;
+    sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
+                    reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
+
+    qint64 bytesSent = m_serverSocket->write(sendData.data(), sendData.size());
+    if (bytesSent == -1) {
+        qDebug() << "[心跳] 发送失败：" << m_serverSocket->errorString();
+    } else {
+        qDebug() << "[心跳] 发送成功，字节数：" << bytesSent;
+    }
 }
