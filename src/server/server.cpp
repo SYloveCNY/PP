@@ -13,29 +13,27 @@
 #include <unistd.h>
 #include "protocol_base.h" // 包含之前定义的PacketHeader、UserInfo等结构体
 
-// 全局在线用户列表（key：userId，value：用户信息，与原版一致）
-std::map<int, UserInfo> gOnlineUsers;
-// 全局互斥锁（线程安全）
-std::mutex gMutex;
-// 辅助映射：fd → userId（用于心跳处理时快速查找用户）
-std::map<int, int> gFdToUserId;
-// 心跳超时时间（30秒，3倍客户端心跳间隔）
-const int HEARTBEAT_TIMEOUT = 30;
-// key: userId, value: 时间戳（秒）
-std::map<int, time_t> g_userLastOnlineTime;
-// 心跳检测线程间隔（5秒）
-const int HEARTBEAT_CHECK_INTERVAL = 5;
+// 全局变量定义（带 std:: 前缀，规范命名空间）
+std::map<int, UserInfo> gOnlineUsers;          // 在线用户列表（key=userId，value=UserInfo）
+std::map<int, int> gFdToUserId;                // fd→userId 映射（通过fd查userId）
+std::map<int, int> gUserIdToFd;                // userId→fd 映射（通过userId查fd，关键！）
+std::map<int, time_t> gUserLastOnlineTime;     // 用户最后在线时间（心跳检测用）
+const int HEARTBEAT_TIMEOUT = 10;              // 心跳超时时间（10秒）
+// 新增：全局互斥锁（保证多线程操作共享数据的线程安全）
+std::mutex gMutex;  // 关键！解决所有 "gMutex 未声明" 错误
 
 // 函数声明
 void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg);
 void broadcastPacket(MsgType msgType, const std::vector<char>& data, int excludeFd);
 void handleLoginReq(int clientFd, const std::vector<char>& data);
+void handleClientData(int clientFd, const std::vector<char>& recvData);
 void handleHeartbeat(int clientFd, int userId);
 void handleCommonMsg(int clientFd, const std::vector<char>& data); // 补充声明
 void heartbeatCheckThread();
 bool recvCompletePacket(int fd, PacketHeader& header, std::vector<char>& data);
 void updateUserHeartbeat(int userId); // 新增：更新用户心跳时间戳
 int getUserIdByManagePort(int managePort); // 新增：通过managePort获取userId
+int getUserIdByFd(int clientFd);
 
 // 广播数据包给所有在线用户（排除发送者自身）
 void broadcastPacket(MsgType msgType, const std::vector<char>& data, int excludeFd) {
@@ -56,7 +54,7 @@ void broadcastPacket(MsgType msgType, const std::vector<char>& data, int exclude
 // 处理客户端心跳包（更新心跳时间）
 void handleHeartbeat(int clientFd, int userId) {
     // 更新用户最后在线时间
-    g_userLastOnlineTime[userId] = time(nullptr);
+    gUserLastOnlineTime[userId] = time(nullptr);
     std::cout << "[心跳处理] 客户端fd=" << clientFd << "，userId=" << userId << " 心跳更新" << std::endl;
 
     // 可选：服务端回复心跳（客户端可忽略，仅确认收到）
@@ -65,6 +63,7 @@ void handleHeartbeat(int clientFd, int userId) {
     header.dataLen = htonl(0);
     sendPacket(clientFd, HEARTBEAT, {}); // sendPacket是你服务端的发送函数
 }
+
 // 处理普通消息（点对点/广播）
 void handleCommonMsg(int clientFd, const std::vector<char>& payload) {
     try {
@@ -108,33 +107,6 @@ void handleCommonMsg(int clientFd, const std::vector<char>& payload) {
 }
 
 // 心跳检测线程（清理超时用户）
-void heartbeatCheckThread() {
-    while (true) {
-        sleep(1); // 每秒检查一次
-        time_t now = time(nullptr);
-
-        // 遍历所有在线用户，检查超时
-        for (auto it = g_onlineUsers.begin(); it != g_onlineUsers.end(); ) {
-            int userId = it->first;
-            int clientFd = it->second.fd;
-
-            // 若用户无心跳记录或超时，强制下线
-            if (g_userLastOnlineTime.find(userId) == g_userLastOnlineTime.end() 
-                || (now - g_userLastOnlineTime[userId]) > HEARTBEAT_TIMEOUT) {
-                
-                std::cout << "用户超时离线：userId=" << userId << "，nickname=" << it->second.nickname << "，fd=" << clientFd << std::endl;
-                // 关闭连接+清理资源
-                close(clientFd);
-                g_onlineUsers.erase(it++);
-                g_userLastOnlineTime.erase(userId);
-                // 广播用户下线通知（其他在线用户）
-                broadcastUserOffline(it->second);
-            } else {
-                ++it;
-            }
-        }
-    }
-}
 
 // 发送登录响应
 void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg) {
@@ -175,8 +147,10 @@ void handleLoginReq(int clientFd, const std::vector<char>& data) {
         // 加入在线用户列表（线程安全）
         {
             std::lock_guard<std::mutex> lock(gMutex);
-            gOnlineUsers[userId] = user;
-            gFdToUserId[clientFd] = userId; // 记录fd与userId的映射
+            gOnlineUsers[userId] = user;          // 添加到在线用户列表
+            gFdToUserId[clientFd] = userId;       // fd → userId 映射
+            gUserIdToFd[userId] = clientFd;       // userId → fd 映射（关键！心跳检测需要）
+            gUserLastOnlineTime[userId] = time(nullptr); // 初始化心跳时间
         }
 
         // 发送登录成功响应
@@ -216,6 +190,11 @@ void handleClientData(int clientFd, const std::vector<char>& recvData) {
     header.msgType = ntohl(header.msgType);   // 关键：转字节序
     header.dataLen = ntohl(header.dataLen);   // 关键：转字节序
 
+    // 验证：打印转换后的 msgType（应该是 3=USER_LIST_REQ、10=HEARTBEAT、7=COMMON_MSG）
+    std::cout << "[包头解析] 转换后 msgType=" << header.msgType 
+              << "，dataLen=" << header.dataLen << std::endl;
+
+
     // 2. 打印解析后的消息类型（验证是否正确）
     std::cout << "[服务端解析] 客户端fd=" << clientFd
               << "，msgType=" << header.msgType
@@ -226,16 +205,21 @@ void handleClientData(int clientFd, const std::vector<char>& recvData) {
         case USER_LIST_REQ:
             handleUserListReq(clientFd); // 处理用户列表请求
             break;
-        case HEARTBEAT:
-            handleHeartbeat(clientFd);  // 处理心跳（更新用户在线时间）
+        case HEARTBEAT:{
+            int userId = getUserIdByFd(clientFd); // 假设存在该函数，通过fd获取用户ID
+            if (userId != -1) {
+                handleHeartbeat(clientFd, userId); // 传入userId参数
+            }
             break;
-        case COMMON_MSG:
+        }
+        case COMMON_MSG:{
             handleCommonMsg(clientFd, recvData); // 处理聊天消息
             break;
-        // ... 其他消息类型 ...
-        default:
+        }
+        default:{
             std::cout << "未知消息类型：" << header.msgType << "，来自fd=" << clientFd << std::endl;
             break;
+        }
     }
 }
 
@@ -298,9 +282,13 @@ void handleClient(int clientFd) {
                 case USER_LIST_REQ:
                     handleUserListReq(clientFd);
                     break;
-                case HEARTBEAT:
-                    handleHeartbeat(clientFd);
+                case HEARTBEAT:{
+                int userId = getUserIdByFd(clientFd);
+                if (userId != -1) {
+                    handleHeartbeat(clientFd, userId);
+                }
                     break;
+            }
                 default:
                     std::cerr << "未知消息类型：" << header.msgType << "，来自fd=" << clientFd << std::endl;
                     break;
@@ -376,6 +364,64 @@ std::vector<char> serializeUserList(const std::map<int, UserInfo>& users) {
         data.insert(data.end(), userData.begin(), userData.end());
     }
     return data;
+}
+
+int getUserIdByFd(int clientFd) {
+    auto it = gFdToUserId.find(clientFd);
+    if (it != gFdToUserId.end()) {
+        return it->second;
+    }
+    std::cout << "警告：fd=" << clientFd << " 未找到对应的userId" << std::endl;
+    return -1;
+}
+
+// 心跳检测线程：定期检查用户超时，清理离线用户
+void heartbeatCheckThread() {
+    while (true) { // 无限循环，持续检测
+        sleep(1); // 每秒检查一次（降低CPU占用）
+        time_t now = time(nullptr); // 当前时间戳（秒）
+
+        // 遍历所有在线用户（gOnlineUsers：key=userId，value=UserInfo）
+        for (auto it = gOnlineUsers.begin(); it != gOnlineUsers.end(); ) {
+            int userId = it->first;
+            // 通过 userId→fd 映射获取客户端文件描述符
+            auto fdIt = gUserIdToFd.find(userId);
+            if (fdIt == gUserIdToFd.end()) {
+                // 找不到对应的fd，直接清理该用户
+                std::cout << "[心跳检测]  userId=" << userId << " 无对应fd，清理离线" << std::endl;
+                gUserLastOnlineTime.erase(userId);
+                it = gOnlineUsers.erase(it);
+                continue;
+            }
+            int clientFd = fdIt->second;
+
+            // 检查心跳超时：无心跳记录 或 超时（>10秒）
+            auto heartIt = gUserLastOnlineTime.find(userId);
+            bool isTimeout = (heartIt == gUserLastOnlineTime.end()) 
+                           || (now - heartIt->second) > HEARTBEAT_TIMEOUT;
+
+            if (isTimeout) {
+                // 处理超时离线：关闭连接+清理资源+广播下线
+                std::cout << "用户超时离线：userId=" << userId 
+                          << "，nickname=" << it->second.nickname 
+                          << "，fd=" << clientFd << std::endl;
+
+                // 1. 关闭客户端连接
+                close(clientFd);
+                // 2. 清理映射表
+                gFdToUserId.erase(clientFd);
+                gUserIdToFd.erase(userId);
+                gUserLastOnlineTime.erase(userId);
+                // 3. 广播用户下线通知（给所有在线客户端）
+                std::vector<char> offlineData = serializeUserInfo(it->second);
+                broadcastPacket(USER_OFFLINE_NOTIFY, offlineData, -1); // -1=不排除任何客户端
+                // 4. 从在线用户列表删除
+                it = gOnlineUsers.erase(it);
+            } else {
+                ++it; // 未超时，继续遍历下一个用户
+            }
+        }
+    }
 }
 
 int main() {
