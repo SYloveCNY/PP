@@ -114,65 +114,52 @@ ChatWindow::~ChatWindow() {
 }
 
 // 发送消息核心函数（已有实现，保持不变）
-void ChatWindow::sendMessage() {
-    QString content = m_inputEdit->toPlainText().trimmed();
-    if (content.isEmpty()) {
-        QMessageBox::warning(this, "提示", "消息内容不能为空！");
-        return;
-    }
-
-    // 优化1：未选择用户（默认广播）时，添加二次确认
-    if (m_selectedUserId == 0) {
-        QMessageBox::StandardButton ret = QMessageBox::question(
-            this, "确认广播", 
-            "未选择具体用户，是否发送广播消息（所有在线用户可见）？",
-            QMessageBox::Yes | QMessageBox::No
-        );
-        if (ret != QMessageBox::Yes) {
-            return; // 用户取消，不发送
-        }
-    }
-
-    // 优化2：再次检查连接状态（双重保障）
-    if (m_serverSocket->state() != QAbstractSocket::ConnectedState) {
-        QMessageBox::warning(this, "错误", "与服务端的连接已断开，无法发送消息！");
+void ChatWindow::sendMessage(const QString &content) {
+    if (content.isEmpty() || m_selectedUserId == -1) {
+        QMessageBox::warning(this, "警告", "消息不能为空或未选择接收者！");
         return;
     }
 
     try {
         CommonMsg msg;
-        msg.fromUserId = m_userId;
-        msg.fromNickname = m_nickname.toStdString();
-        msg.content = content.toStdString();
-        msg.toUserId = m_selectedUserId; // 已通过选择更新，0=广播
+        msg.fromUserId = m_userId;                  // 本地用户ID（主机字节序）
+        msg.toUserId = m_selectedUserId;            // 目标用户ID（主机字节序）
+        msg.fromNickname = m_nickname.toStdString();// 昵称
+        msg.content = content.toStdString();        // 消息内容
 
-        qDebug() << "[sendMessage] 发送消息：" << content 
-                 << " 目标用户ID：" << m_selectedUserId;
+        // 序列化消息体（确保调用修复后的 serializeCommonMsg）
+        std::vector<char> payload = serializeCommonMsg(msg);
 
-        // 序列化+发送（沿用之前的逻辑）
-        std::vector<char> msgData = serializeCommonMsg(msg);
+        // 构造包头（关键：msgType 和 dataLen 转网络字节序）
         PacketHeader header;
-        header.msgType = COMMON_MSG;
-        header.dataLen = static_cast<uint32_t>(msgData.size());
+        header.msgType = htonl(COMMON_MSG);         // 消息类型→网络字节序
+        header.dataLen = htonl(static_cast<uint32_t>(payload.size())); // 长度→网络字节序
 
+        // 构造完整数据包
         std::vector<char> sendData;
-        sendData.insert(sendData.end(), reinterpret_cast<char*>(&header), 
+        sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
                         reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
-        sendData.insert(sendData.end(), msgData.begin(), msgData.end());
+        sendData.insert(sendData.end(), payload.begin(), payload.end());
 
-        qint64 bytesSent = m_serverSocket->write(sendData.data(), sendData.size());
-        if (bytesSent == -1) {
-            throw std::runtime_error(m_serverSocket->errorString().toStdString());
+        // 发送数据
+        qint64 sent = m_serverSocket->write(sendData.data(), sendData.size());
+        if (sent == -1) {
+            throw std::runtime_error("发送消息失败：" + m_serverSocket->errorString().toStdString());
         }
 
-        // 发送成功后清空输入框+显示自己的消息
-        m_inputEdit->clear();
-        QString senderText = (m_selectedUserId == 0) ? "我（广播）" : "我";
-        showMessage(senderText, content);
+        // 本地显示自己的消息
+        QString sender = "我";
+        if (m_selectedUserId == 0) sender += "（广播）";
+        else sender += QString("（发给ID:%1）").arg(m_selectedUserId);
+        showMessage(sender, content);
 
+        qDebug() << "[sendMessage] 发送成功：内容=" << content
+                 << "，目标ID=" << m_selectedUserId
+                 << "，总字节数=" << sendData.size();
     } catch (const std::exception& e) {
-        QMessageBox::critical(this, "发送失败", 
-                             "消息发送失败：" + QString::fromStdString(e.what()));
+        QString err = "发送消息失败：" + QString::fromStdString(e.what());
+        showMessage("系统", err);
+        qDebug() << err;
     }
 }
 
@@ -184,30 +171,6 @@ void ChatWindow::onSendClicked() {
 void ChatWindow::onTextEdited() {
     // 可选：处理文本变化逻辑（如按钮状态控制）
     m_sendBtn->setEnabled(!m_inputEdit->toPlainText().trimmed().isEmpty());
-}
-
-// 新增：用户选择槽函数（实现）
-void ChatWindow::onUserSelected(QListWidgetItem *item) {
-    if (!item) return;
-
-    QString itemText = item->text();
-    qDebug() << "[onUserSelected] 选择的用户：" << itemText;
-
-    // 解析 item 文本中的用户ID（格式："昵称 (ID: X)" 或 "广播 (ID: 0)"）
-    int idStart = itemText.indexOf("ID: ") + 4;
-    int idEnd = itemText.indexOf(")", idStart);
-    if (idStart < 4 || idEnd == -1) {
-        m_selectedUserId = 0; // 解析失败默认广播
-        qDebug() << "[onUserSelected] 解析ID失败，默认广播";
-        return;
-    }
-
-    // 更新选中的用户ID
-    m_selectedUserId = itemText.mid(idStart, idEnd - idStart).toInt();
-    qDebug() << "[onUserSelected] 选中用户ID：" << m_selectedUserId;
-
-    // 可选：高亮选中项（优化体验）
-    m_userList->setCurrentItem(item);
 }
 
 // 重写键盘事件（捕捉回车发送，修复QTextEdit无returnPressed）
@@ -225,161 +188,285 @@ void ChatWindow::keyPressEvent(QKeyEvent *event) {
 }
 
 // 更新在线用户列表
-void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo>& users) {
-    m_userList->clear(); // 清空现有列表（含初始的“广播”）
-    m_userList->addItem("广播 (ID: 0)"); // 重新添加广播选项
+void ChatWindow::updateOnlineUsers(const std::map<int, UserInfo>& onlineUsers) {
+    qDebug() << "[updateOnlineUsers] 开始更新UI，当前在线用户数=" << onlineUsers.size();
 
-    qDebug() << "[updateOnlineUsers] 服务端返回在线用户数：" << users.size();
-    for (const auto& [userId, user] : users) {
-        // 跳过当前用户自己（避免显示自己）
+    // ==================================
+    // 第一步：清空列表+基础设置（避免重复/隐藏）
+    // ==================================
+    m_userList->clear();
+    // 强制设置列表属性（防止被布局挤压/隐藏）
+    m_userList->setFixedWidth(220); // 固定宽度，确保能看到
+    m_userList->setMinimumHeight(300); // 最小高度
+    m_userList->setVisible(true); // 强制显示
+    m_userList->setSelectionMode(QAbstractItemView::SingleSelection); // 单选模式
+    m_userList->setStyleSheet("QListWidget { border: 1px solid #ccc; border-radius: 4px; padding: 5px; }"
+                              "QListWidget::item { padding: 8px; margin: 2px; border-radius: 2px; }"
+                              "QListWidget::item:selected { background-color: #4A90E2; color: white; }");
+
+    // ==================================
+    // 第二步：添加「广播」选项（默认选中）
+    // ==================================
+    QListWidgetItem* broadcastItem = new QListWidgetItem("📢 广播 (ID: 0)");
+    broadcastItem->setData(Qt::UserRole, 0); // 存储目标用户ID（0=广播）
+    m_userList->addItem(broadcastItem);
+
+    // ==================================
+    // 第三步：添加所有在线用户（跳过自己）
+    // ==================================
+    for (const auto& [userId, user] : onlineUsers) {
+        // 跳过当前登录用户自己
         if (userId == m_userId) {
-            qDebug() << "[updateOnlineUsers] 跳过当前用户：ID=" << userId;
+            qDebug() << "[updateOnlineUsers] 跳过自己：ID=" << userId << "，昵称=" << QString::fromStdString(user.nickname);
             continue;
         }
 
-        // 构建用户条目（处理空昵称、确保格式正确）
+        // 构建用户条目（昵称+ID，避免昵称为空）
         QString nickname = QString::fromStdString(user.nickname);
-        if (nickname.isEmpty()) nickname = QString("用户%1").arg(userId);
-        QString itemText = QString("%1 (ID: %2)").arg(nickname).arg(userId);
-        
-        // 添加到列表并验证
-        m_userList->addItem(itemText);
-         qDebug() << "[updateOnlineUsers] 成功添加用户：" << itemText;
+        if (nickname.isEmpty() || nickname.trimmed().isEmpty()) {
+            nickname = QString("用户%1").arg(userId);
+        }
+        QString itemText = QString("👤 %1 (ID: %2)").arg(nickname).arg(userId);
+
+        // 添加到列表+存储用户ID（方便后续发送消息）
+        QListWidgetItem* userItem = new QListWidgetItem(itemText);
+        userItem->setData(Qt::UserRole, userId); // 关联用户ID
+        m_userList->addItem(userItem);
+
+        qDebug() << "[updateOnlineUsers] 添加用户：" << itemText;
     }
 
-    // 可选：默认选中“广播”选项
+    // ==================================
+    // 第四步：默认选中「广播」+ 更新选中状态
+    // ==================================
     if (m_userList->count() > 0) {
-        m_userList->setCurrentRow(0);
+        m_userList->setCurrentItem(m_userList->item(0));
         m_selectedUserId = 0; // 默认广播
+        qDebug() << "[updateOnlineUsers] 默认选中：广播（ID=0）";
+    } else {
+        m_selectedUserId = -1;
+        qDebug() << "[updateOnlineUsers] 无在线用户（除自己外）";
     }
+
+    // ==================================
+    // 第五步：强制UI刷新（解决Qt布局延迟问题）
+    // ==================================
+    m_userList->update();
+    m_userList->repaint();
+    qDebug() << "[updateOnlineUsers] UI更新完成，列表总条目数=" << m_userList->count();
 }
 
-// 接收服务端消息（修复updateOnlineUsers和m_onlineUsers调用）
-void ChatWindow::onServerReadyRead() {
-    // 追加新数据到缓存
-    m_recvBuffer.append(m_serverSocket->readAll());
-
-    // 循环处理缓存中的完整数据包
-    while (m_recvBuffer.size() >= sizeof(PacketHeader)) {
-        // 解析包头
-        PacketHeader* header = reinterpret_cast<PacketHeader*>(m_recvBuffer.data());
-        // 检查数据包是否完整（包头+数据）
-        if (m_recvBuffer.size() < sizeof(PacketHeader) + header->dataLen) {
-            break; // 数据不完整，等待下一次readyRead
-        }
-
-        // 提取 payload
-        std::vector<char> payload(
-            m_recvBuffer.begin() + sizeof(PacketHeader),
-            m_recvBuffer.begin() + sizeof(PacketHeader) + header->dataLen
-        );
-
-        // 处理不同类型的消息
-        switch (header->msgType) {
-            case USER_LIST_RSP: {
-                try {
-                    std::map<int, UserInfo> users = deserializeUserList(payload);
-                    qDebug() << "[USER_LIST_RSP] 解析到在线用户数：" << users.size();
-                    for (const auto& [userId, user] : users) {
-                        qDebug() << "  - 用户ID：" << userId 
-                                << " 昵称：" << QString::fromStdString(user.nickname)
-                                << " IP：" << QString::fromStdString(user.ip);
-                    }
-
-                    // 更新本地在线用户列表+UI
-                    m_onlineUsers = users;
-                    updateOnlineUsers(m_onlineUsers);
-
-                    // 显示提示（含用户数）
-                    QString tip = QString("在线用户列表获取成功（共%1人）").arg(users.size());
-                    showMessage("系统", tip);
-
-                } catch (const std::exception& e) {
-                    QString errMsg = "解析用户列表失败：" + QString::fromStdString(e.what());
-                    showMessage("系统", errMsg);
-                    qDebug() << "[USER_LIST_RSP] 错误：" << errMsg;
-                }
-                break;
-            }
-            case COMMON_MSG: {
-                try {
-                    CommonMsg msg = deserializeCommonMsg(payload);
-                    showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
-                } catch (const std::exception& e) {
-                    showMessage("系统", "解析消息失败：" + QString::fromStdString(e.what()));
-                }
-                break;
-            }
-            case USER_ONLINE_NOTIFY: {
-                try {
-                    UserInfo user = deserializeUserInfo(payload);
-                    m_onlineUsers[user.userId] = user; // 添加到本地在线列表
-                    updateOnlineUsers(m_onlineUsers); // 刷新UI
-                    showMessage("系统", QString("用户「%1」已上线").arg(QString::fromStdString(user.nickname)));
-                } catch (const std::exception& e) {
-                    showMessage("系统", "解析上线通知失败：" + QString::fromStdString(e.what()));
-                }
-                break;
-            }
-            case USER_OFFLINE_NOTIFY: {
-                try {
-                    UserInfo user = deserializeUserInfo(payload);
-                    m_onlineUsers.erase(user.userId); // 从本地列表移除
-                    updateOnlineUsers(m_onlineUsers); // 刷新UI
-                    showMessage("系统", QString("用户「%1」已下线").arg(QString::fromStdString(user.nickname)));
-                } catch (const std::exception& e) {
-                    showMessage("系统", "解析下线通知失败：" + QString::fromStdString(e.what()));
-                }
-                break;
-            }
-            default:
-                showMessage("系统", "收到无效信息（未知消息类型）");
-                break;
-        }
-
-        // 移除已处理的数据包
-        m_recvBuffer.remove(0, sizeof(PacketHeader) + header->dataLen);
+// 选择在线用户（更新目标用户ID）
+void ChatWindow::onUserSelected(QListWidgetItem *item) {
+    if (!item) return;
+    QString itemText = item->text();
+    int idStart = itemText.indexOf("ID: ") + 4;
+    int idEnd = itemText.indexOf(")", idStart);
+    if (idStart >= 4 && idEnd != -1) {
+        m_selectedUserId = itemText.mid(idStart, idEnd - idStart).toInt();
+        qDebug() << "[选择用户] 目标用户ID：" << m_selectedUserId;
+    } else {
+        m_selectedUserId = 0; // 解析失败默认广播
     }
 }
 
 // 接收UDP点对点消息（已有实现，保持不变）
-void ChatWindow::onUdpReadyRead() {
-    QByteArray datagram;
-    datagram.resize(m_udpSocket->pendingDatagramSize());
-    QHostAddress senderAddr;
-    quint16 senderPort;
+void ChatWindow::onServerReadyRead() {
+    // ==================================
+    // 第一步：检查Socket状态（排除连接问题）
+    // ==================================
+    if (m_serverSocket->state() != QAbstractSocket::ConnectedState) {
+        qDebug() << "[onServerReadyRead] 错误：Socket未连接，状态码：" << m_serverSocket->state();
+        return;
+    }
+    if (m_serverSocket->error() != QAbstractSocket::UnknownSocketError) {
+        qDebug() << "[onServerReadyRead] 错误：Socket异常，错误信息：" << m_serverSocket->errorString();
+        QMessageBox::warning(this, "网络错误", "与服务端连接异常：" + m_serverSocket->errorString());
+        return;
+    }
 
-    qint64 len = m_udpSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
-    if (len <= 0) return;
+    // ==================================
+    // 第二步：读取数据到缓存（处理粘包/半包）
+    // ==================================
+    QByteArray newData = m_serverSocket->readAll();
+    if (newData.isEmpty()) {
+        qDebug() << "[onServerReadyRead] 收到TCP空包（正常连接保持，跳过）";
+        return;
+    }
 
-    try {
-        CommonMsg msg = deserializeCommonMsg(std::vector<char>(datagram.begin(), datagram.end()));
-        showMessage(QString::fromStdString(msg.fromNickname), QString::fromStdString(msg.content));
-    } catch (const std::exception& e) {
-        qDebug() << "解析UDP消息失败：" << e.what();
+    // 打印接收详情（十六进制+长度，方便抓包核对）
+    qDebug() << "[onServerReadyRead] 接收数据：字节数=" << newData.size()
+             << "，十六进制=" << newData.toHex()
+             << "，缓存当前总长度=" << m_recvBuffer.size() + newData.size();
+    m_recvBuffer.append(newData);
+
+    // ==================================
+    // 第三步：循环解析完整数据包
+    // ==================================
+    while (m_recvBuffer.size() >= sizeof(PacketHeader)) {
+    // 1. 读取原始包头（网络字节序）
+    PacketHeader header;
+    memcpy(&header, m_recvBuffer.data(), sizeof(PacketHeader));
+    
+    // 2. 网络字节序 → 主机字节序（核心修复！之前遗漏这步）
+    header.msgType = ntohl(header.msgType);   // 消息类型转字节序
+    header.dataLen = ntohl(header.dataLen);   // 数据长度转字节序
+    
+    // 打印转换后的包头（确认正确）
+    qDebug() << "[解析包头] 转换后 msgType=" << header.msgType
+             << "，dataLen=" << header.dataLen
+             << "，包头长度=" << sizeof(PacketHeader);
+
+    // 3. 检查数据包完整性（后续逻辑不变）
+    uint32_t totalPacketLen = sizeof(PacketHeader) + header.dataLen;
+    if (m_recvBuffer.size() < totalPacketLen) {
+        qDebug() << "[数据不完整] 缓存长度=" << m_recvBuffer.size()
+                 << "，需要长度=" << totalPacketLen
+                 << "，等待后续数据...";
+        break;
+    }
+
+        // 提取payload（消息体）
+        std::vector<char> payload(
+            m_recvBuffer.begin() + sizeof(PacketHeader),
+            m_recvBuffer.begin() + totalPacketLen
+        );
+        qDebug() << "[提取Payload] 长度=" << payload.size() << "，开始处理消息类型=" << header.msgType;
+
+        // 移除已处理的数据包（避免重复解析）
+        m_recvBuffer.remove(0, totalPacketLen);
+        qDebug() << "[处理完成] 剩余缓存长度=" << m_recvBuffer.size();
+
+        // ==================================
+        // 第四步：处理不同类型消息
+        // ==================================
+        switch (header.msgType) {
+            // ------------------------------
+            // 在线用户列表响应（登录后获取）
+            // ------------------------------
+            case USER_LIST_RSP: {
+                try {
+                    std::map<int, UserInfo> onlineUsers = deserializeUserList(payload);
+                    qDebug() << "[USER_LIST_RSP] 解析成功，在线用户数=" << onlineUsers.size();
+                    for (const auto& [userId, user] : onlineUsers) {
+                        qDebug() << "  - 用户：ID=" << userId
+                                 << "，昵称=" << QString::fromStdString(user.nickname)
+                                 << "，IP=" << QString::fromStdString(user.ip);
+                    }
+                    // 更新本地用户列表+UI
+                    m_onlineUsers = onlineUsers;
+                    updateOnlineUsers(m_onlineUsers);
+                    showMessage("系统", "在线用户列表加载完成（共" + QString::number(onlineUsers.size()) + "人）");
+                } catch (const std::exception& e) {
+                    QString errMsg = "解析用户列表失败：" + QString::fromStdString(e.what());
+                    qDebug() << "[USER_LIST_RSP] 错误：" << errMsg;
+                    showMessage("系统", errMsg);
+                }
+                break;
+            }
+
+            // ------------------------------
+            // 用户上线通知（实时推送）
+            // ------------------------------
+            case USER_ONLINE_NOTIFY: {
+                try {
+                    UserInfo newUser = deserializeUserInfo(payload);
+                    qDebug() << "[USER_ONLINE_NOTIFY] 新用户上线：ID=" << newUser.userId
+                             << "，昵称=" << QString::fromStdString(newUser.nickname);
+                    // 添加到本地列表+更新UI
+                    m_onlineUsers[newUser.userId] = newUser;
+                    updateOnlineUsers(m_onlineUsers);
+                    showMessage("系统", QString::fromStdString(newUser.nickname) + " 已上线");
+                } catch (const std::exception& e) {
+                    QString errMsg = "解析上线通知失败：" + QString::fromStdString(e.what());
+                    qDebug() << "[USER_ONLINE_NOTIFY] 错误：" << errMsg;
+                    showMessage("系统", errMsg);
+                }
+                break;
+            }
+
+            // ------------------------------
+            // 用户下线通知（实时推送）
+            // ------------------------------
+            case USER_OFFLINE_NOTIFY: {
+                try {
+                    UserInfo offlineUser = deserializeUserInfo(payload);
+                    qDebug() << "[USER_OFFLINE_NOTIFY] 用户下线：ID=" << offlineUser.userId
+                             << "，昵称=" << QString::fromStdString(offlineUser.nickname);
+                    // 从本地列表移除+更新UI
+                    m_onlineUsers.erase(offlineUser.userId);
+                    updateOnlineUsers(m_onlineUsers);
+                    showMessage("系统", QString::fromStdString(offlineUser.nickname) + " 已下线");
+                } catch (const std::exception& e) {
+                    QString errMsg = "解析下线通知失败：" + QString::fromStdString(e.what());
+                    qDebug() << "[USER_OFFLINE_NOTIFY] 错误：" << errMsg;
+                    showMessage("系统", errMsg);
+                }
+                break;
+            }
+
+            // ------------------------------
+            // 普通消息（点对点/广播）
+            // ------------------------------
+            case COMMON_MSG: {
+                try {
+                    CommonMsg chatMsg = deserializeCommonMsg(payload);
+                    qDebug() << "[COMMON_MSG] 解析成功："
+                             << "fromUserId=" << chatMsg.fromUserId
+                             << "，fromNickname=" << QString::fromStdString(chatMsg.fromNickname)
+                             << "，toUserId=" << chatMsg.toUserId
+                             << "，content=" << QString::fromStdString(chatMsg.content);
+
+                    // 格式化发送者名称（广播标注）
+                    QString senderName = QString::fromStdString(chatMsg.fromNickname);
+                    if (chatMsg.toUserId == 0) {
+                        senderName += "（广播）";
+                    }
+
+                    // 显示到聊天窗口（带时间戳）
+                    showMessage(senderName, QString::fromStdString(chatMsg.content));
+                } catch (const std::exception& e) {
+                    QString errMsg = "解析聊天消息失败：" + QString::fromStdString(e.what());
+                    qDebug() << "[COMMON_MSG] 错误：" << errMsg;
+                    showMessage("系统", errMsg);
+                }
+                break;
+            }
+
+            // ------------------------------
+            // 未知消息类型
+            // ------------------------------
+            default:
+                qDebug() << "[未知消息] 收到未定义消息类型：" << header.msgType;
+                showMessage("系统", "收到未知类型消息，可能是版本不兼容");
+                break;
+        }
     }
 }
 
 // 显示消息（已有实现，保持不变）
 void ChatWindow::showMessage(const QString &sender, const QString &content) {
+    qDebug() << "[显示消息] 发送者：" << sender << "，内容：" << content;
+
+    // 临时弹窗（无论UI是否有问题，都会显示）
+    QMessageBox::information(this, "收到消息", QString("%1：%2").arg(sender, content));
+
     QString time = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     QString msg = QString("[%1] %2：%3").arg(time).arg(sender).arg(content);
     m_chatList->addItem(msg);
     m_chatList->scrollToBottom(); // 自动滚动到最新消息
 }
 
-// 新增：发送心跳包的实现
+// 发送心跳包
 void ChatWindow::sendHeartbeat() {
     if (m_serverSocket->state() != QAbstractSocket::ConnectedState) {
         qDebug() << "[心跳] 连接已断开，跳过发送";
         return;
     }
 
-    // 构造心跳数据包（无payload，仅包头）
     PacketHeader header;
     header.msgType = HEARTBEAT;
     header.dataLen = 0;
-
     std::vector<char> sendData;
     sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
                     reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
@@ -387,7 +474,13 @@ void ChatWindow::sendHeartbeat() {
     qint64 bytesSent = m_serverSocket->write(sendData.data(), sendData.size());
     if (bytesSent == -1) {
         qDebug() << "[心跳] 发送失败：" << m_serverSocket->errorString();
-    } else {
-        qDebug() << "[心跳] 发送成功，字节数：" << bytesSent;
     }
+}
+
+void ChatWindow::onUdpReadyRead() {
+    // 目前UDP未使用，添加基础日志（后续扩展时再完善逻辑）
+    qDebug() << "[UDP接收] 收到UDP数据（当前未处理）";
+    
+    // 若不需要日志，直接空实现也可：
+    // （空实现不影响程序运行，仅占位避免链接错误）
 }

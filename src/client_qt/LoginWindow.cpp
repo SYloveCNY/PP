@@ -131,18 +131,30 @@ void LoginWindow::onReadyRead() {
         return;
     }
 
-    PacketHeader *header = reinterpret_cast<PacketHeader*>(data.data());
+    PacketHeader* header = reinterpret_cast<PacketHeader*>(data.data());
     if (header->msgType == LOGIN_RSP) {
-        LoginRsp rsp = deserializeLoginRsp(std::vector<char>(data.begin() + sizeof(PacketHeader), data.end()));
+        std::vector<char> payload(data.begin() + sizeof(PacketHeader), data.end());
+        LoginRsp rsp = deserializeLoginRsp(payload);
         if (rsp.success) {
             QMessageBox::information(this, "成功", QString("登录成功！用户ID：%1").arg(rsp.userId));
             
-            // 关键修复：解除socket与LoginWindow的关联，避免被销毁
+            // 关键1：解除socket与LoginWindow的关联，避免被销毁
             serverSocket->setParent(nullptr);
             udpSocket->setParent(nullptr);
-            
+
+            // 关键2：登录成功后立即发送用户列表请求
+            PacketHeader listReqHeader;
+            listReqHeader.msgType = USER_LIST_REQ;
+            listReqHeader.dataLen = 0;
+            std::vector<char> listReqData;
+            listReqData.insert(listReqData.end(), reinterpret_cast<char*>(&listReqHeader),
+                              reinterpret_cast<char*>(&listReqHeader) + sizeof(PacketHeader));
+            serverSocket->write(listReqData.data(), listReqData.size());
+            qDebug() << "登录成功，已发送用户列表请求";
+
+            // 打开聊天窗口
             emit loginSuccess(rsp.userId, QString::fromStdString(rsp.nickname), serverSocket, udpSocket);
-            this->close(); // 此时LoginWindow销毁不会影响socket
+            this->close();
         } else {
             QMessageBox::critical(this, "失败", QString("登录失败：%1").arg(QString::fromStdString(rsp.msg)));
             loginBtn->setText("登录");

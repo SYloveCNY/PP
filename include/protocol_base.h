@@ -67,34 +67,36 @@ inline bool isValidLength(uint32_t len, size_t maxAllowed = 1024 * 1024) {
 }
 
 // ========== 基础序列化/反序列化（纯C++） ==========
+// 序列化字符串：先存长度（uint32_t，网络字节序），再存内容
 inline std::vector<char> serializeString(const std::string& str) {
     std::vector<char> data;
     uint32_t len = static_cast<uint32_t>(str.size());
-    len = htonl(len); // 网络字节序
-    data.insert(data.end(), reinterpret_cast<const char*>(&len),
-                reinterpret_cast<const char*>(&len) + sizeof(uint32_t));
+    uint32_t networkLen = htonl(len); // 长度转换为网络字节序
+    // 写入长度
+    data.insert(data.end(), reinterpret_cast<char*>(&networkLen),
+                reinterpret_cast<char*>(&networkLen) + sizeof(uint32_t));
+    // 写入字符串内容
     if (len > 0) {
         data.insert(data.end(), str.begin(), str.end());
     }
     return data;
 }
 
+// 反序列化字符串：先读长度（网络字节序→主机字节序），再读内容
 inline std::string deserializeString(const std::vector<char>& data, size_t& offset) {
     if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("String length field out of bounds");
+        throw std::out_of_range("string length field out of bounds");
     }
-    uint32_t len = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    len = ntohl(len);
+    // 读取长度并转换为主机字节序
+    uint32_t networkLen = *reinterpret_cast<const uint32_t*>(data.data() + offset);
+    uint32_t len = ntohl(networkLen);
     offset += sizeof(uint32_t);
-    
-    if (!isValidLength(len) || (offset + len) > data.size()) {
-        throw std::length_error("Invalid string length: " + std::to_string(len));
+
+    // 读取字符串内容
+    if (offset + len > data.size()) {
+        throw std::out_of_range("string content field out of bounds");
     }
-    
-    std::string str;
-    if (len > 0) {
-        str.assign(data.data() + offset, data.data() + offset + len);
-    }
+    std::string str(data.begin() + offset, data.begin() + offset + len);
     offset += len;
     return str;
 }
@@ -257,6 +259,8 @@ inline UserInfo deserializeUserInfo(const std::vector<char>& data, size_t& offse
     return user;
 }
 
+inline std::vector<char> serializeUserList(const std::map<int, UserInfo>& users);
+
 // 重载：无offset的UserInfo反序列化
 inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
     size_t offset = 0;
@@ -266,17 +270,20 @@ inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
 inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data) {
     std::map<int, UserInfo> users;
     if (data.size() < sizeof(uint32_t)) {
-        throw std::runtime_error("用户列表数据不完整（缺少用户数量）");
+        throw std::runtime_error("用户列表数据过短");
     }
 
-    // 关键修复：用ntohl转换网络字节序到主机字节序
+    // 关键修复：网络字节序→主机字节序（必须调用ntohl）
     uint32_t networkCount;
     memcpy(&networkCount, data.data(), sizeof(uint32_t));
-    uint32_t userCount = ntohl(networkCount); // 对应服务端的htonl
+    uint32_t userCount = ntohl(networkCount); // 漏了这行会导致解析失败！
 
     size_t offset = sizeof(uint32_t);
     for (uint32_t i = 0; i < userCount; ++i) {
-        // 解析单个用户信息（需确保deserializeUserInfo也处理字节序）
+        if (offset + sizeof(UserInfo) > data.size()) { // 或根据实际序列化逻辑判断
+            throw std::runtime_error("用户数据不完整");
+        }
+        // 解析单个用户信息（复用已有的deserializeUserInfo）
         UserInfo user = deserializeUserInfo(data, offset);
         users[user.userId] = user;
     }
@@ -285,14 +292,27 @@ inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data
 
 inline std::vector<char> serializeCommonMsg(const CommonMsg& msg) {
     std::vector<char> data;
-    data.insert(data.end(), reinterpret_cast<const char*>(&msg.fromUserId),
-                reinterpret_cast<const char*>(&msg.fromUserId) + sizeof(int));
+    // 1. 序列化 fromUserId（int→网络字节序）
+    int32_t networkFromUserId = htonl(msg.fromUserId); // 主机字节序→网络字节序
+    data.insert(data.end(), reinterpret_cast<char*>(&networkFromUserId),
+                reinterpret_cast<char*>(&networkFromUserId) + sizeof(int32_t));
+
+    // 2. 序列化 fromNickname（复用上面的字符串序列化）
     auto nicknameData = serializeString(msg.fromNickname);
     data.insert(data.end(), nicknameData.begin(), nicknameData.end());
+
+    // 3. 序列化 content（复用字符串序列化）
     auto contentData = serializeString(msg.content);
     data.insert(data.end(), contentData.begin(), contentData.end());
-    data.insert(data.end(), reinterpret_cast<const char*>(&msg.toUserId),
-                reinterpret_cast<const char*>(&msg.toUserId) + sizeof(int));
+
+    // 4. 序列化 toUserId（int→网络字节序）
+    int32_t networkToUserId = htonl(msg.toUserId);
+    data.insert(data.end(), reinterpret_cast<char*>(&networkToUserId),
+                reinterpret_cast<char*>(&networkToUserId) + sizeof(int32_t));
+
+    std::cout << "[序列化CommonMsg] 长度：" << data.size() 
+              << "，fromUserId（网络字节序）：" << networkFromUserId
+              << "，toUserId（网络字节序）：" << networkToUserId << std::endl;
     return data;
 }
 
@@ -300,44 +320,82 @@ inline CommonMsg deserializeCommonMsg(const std::vector<char>& data) {
     CommonMsg msg;
     size_t offset = 0;
     try {
-        if (offset + sizeof(int) > data.size()) {
-            throw std::out_of_range("fromUserId field out of bounds");
+        // 1. 反序列化 fromUserId（网络字节序→主机字节序）
+        if (offset + sizeof(int32_t) > data.size()) {
+            throw std::out_of_range("fromUserId field out of bounds（需要" + std::to_string(sizeof(int32_t)) + "字节，剩余" + std::to_string(data.size() - offset) + "字节）");
         }
-        msg.fromUserId = *reinterpret_cast<const int*>(data.data() + offset);
-        offset += sizeof(int);
-        
+        int32_t networkFromUserId = 0;
+        memcpy(&networkFromUserId, data.data() + offset, sizeof(int32_t));
+        msg.fromUserId = ntohl(networkFromUserId);
+        offset += sizeof(int32_t);
+        // 纯C++日志（服务端识别）
+        std::cout << "[反序列化CommonMsg] fromUserId：" << msg.fromUserId << std::endl;
+
+        // 2. 反序列化 fromNickname
         msg.fromNickname = deserializeString(data, offset);
+        std::cout << "[反序列化CommonMsg] fromNickname：" << msg.fromNickname << std::endl;
+
+        // 3. 反序列化 content
         msg.content = deserializeString(data, offset);
-        
-        if (offset + sizeof(int) > data.size()) {
-            throw std::out_of_range("toUserId field out of bounds");
+        std::cout << "[反序列化CommonMsg] content：" << msg.content << std::endl;
+
+        // 4. 反序列化 toUserId（网络字节序→主机字节序）
+        if (offset + sizeof(int32_t) > data.size()) {
+            throw std::out_of_range("toUserId field out of bounds（需要" + std::to_string(sizeof(int32_t)) + "字节，剩余" + std::to_string(data.size() - offset) + "字节）");
         }
-        msg.toUserId = *reinterpret_cast<const int*>(data.data() + offset);
-        offset += sizeof(int);
+        int32_t networkToUserId = 0;
+        memcpy(&networkToUserId, data.data() + offset, sizeof(int32_t));
+        msg.toUserId = ntohl(networkToUserId);
+        offset += sizeof(int32_t);
+        std::cout << "[反序列化CommonMsg] toUserId：" << msg.toUserId << std::endl;
+
+        std::cout << "[反序列化CommonMsg成功] 总偏移量：" << offset << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "Deserialize CommonMsg failed: " << e.what() << std::endl;
+        std::string err = "Deserialize CommonMsg failed: " + std::string(e.what());
+        std::cerr << err << std::endl;
+        // 移除 Qt 日志（服务端不支持），仅保留纯C++错误输出
         msg = CommonMsg{};
     }
     return msg;
 }
 
 // ========== 服务端纯C++ sendPacket ==========
-inline bool sendPacket(int fd, uint32_t msgType, const std::vector<char>& data) {
-    PacketHeader header;
-    header.msgType = msgType;
-    header.dataLen = static_cast<uint32_t>(data.size());
-    
-    std::vector<char> sendData;
-    sendData.insert(sendData.end(), reinterpret_cast<const char*>(&header),
-                    reinterpret_cast<const char*>(&header) + sizeof(PacketHeader));
-    sendData.insert(sendData.end(), data.begin(), data.end());
-    
-    ssize_t sent = send(fd, sendData.data(), sendData.size(), 0);
-    if (sent == -1) {
-        std::cerr << "发送数据包失败：" << strerror(errno) << std::endl;
+
+inline bool sendPacket(int targetFd, uint32_t msgType, const std::vector<char>& payload) {
+    try {
+        // 1. 构造 PacketHeader（确保字段正确）
+        PacketHeader header;
+        header.msgType = msgType; // 接收 uint32_t，MsgType 枚举可隐式转换
+        header.dataLen = static_cast<uint32_t>(payload.size());
+
+        // 2. 构建完整发送缓冲区（包头 +  payload）
+        std::vector<char> sendData(sizeof(PacketHeader) + payload.size());
+        // 复制包头（memcpy 避免结构体对齐问题）
+        memcpy(sendData.data(), &header, sizeof(PacketHeader));
+        // 复制 payload（若有数据）
+        if (!payload.empty()) {
+            memcpy(sendData.data() + sizeof(PacketHeader), payload.data(), payload.size());
+        }
+
+        // 3. 循环 send，确保所有数据发送完成（TCP 可能分批发送）
+        ssize_t totalSent = 0;
+        ssize_t dataLen = sendData.size();
+        while (totalSent < dataLen) {
+            ssize_t sent = send(targetFd, sendData.data() + totalSent, dataLen - totalSent, 0);
+            if (sent == -1) {
+                std::cerr << "[sendPacket] 发送失败：fd=" << targetFd << "，错误：" << strerror(errno) << std::endl;
+                return false;
+            }
+            totalSent += sent;
+        }
+
+        // 4. 调试日志（可选，方便排查）
+        // std::cout << "[sendPacket] 成功：fd=" << targetFd << "，消息类型：" << msgType << "，总字节数：" << dataLen << std::endl;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[sendPacket] 异常：" << e.what() << std::endl;
         return false;
     }
-    return true;
 }
 
 #endif // PROTOCOL_BASE_H
