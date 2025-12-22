@@ -14,6 +14,9 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
       m_udpSocket(udpSocket),
       m_recvBuffer() // 初始化接收缓存（避免野指针）
 {
+    // 新增：打印包头大小（必须和服务端一致，都是 8 字节！）
+    qDebug() << "[调试] 客户端 PacketHeader 大小：" << sizeof(PacketHeader);
+    
     // 关键1：接管Socket生命周期（LoginWindow销毁时不会删除Socket）
     m_serverSocket->setParent(this);
     m_udpSocket->setParent(this);

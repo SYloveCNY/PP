@@ -26,7 +26,6 @@ std::mutex gMutex;  // 关键！解决所有 "gMutex 未声明" 错误
 void sendLoginRsp(int clientFd, bool success, int userId, const std::string& msg);
 void broadcastPacket(MsgType msgType, const std::vector<char>& data, int excludeFd);
 void handleLoginReq(int clientFd, const std::vector<char>& data);
-void handleClientData(int clientFd, const std::vector<char>& recvData);
 void handleHeartbeat(int clientFd, int userId);
 void handleCommonMsg(int clientFd, const std::vector<char>& data); // 补充声明
 void heartbeatCheckThread();
@@ -181,48 +180,6 @@ void handleUserListReq(int clientFd) {
     }
 }
 
-void handleClientData(int clientFd, const std::vector<char>& recvData) {
-    // 1. 解析包头（重点：添加ntohl转换）
-    PacketHeader header;
-    memcpy(&header, recvData.data(), sizeof(PacketHeader));
-    
-    // 核心修复：网络字节序 → 主机字节序（之前遗漏这步！）
-    header.msgType = ntohl(header.msgType);   // 关键：转字节序
-    header.dataLen = ntohl(header.dataLen);   // 关键：转字节序
-
-    // 验证：打印转换后的 msgType（应该是 3=USER_LIST_REQ、10=HEARTBEAT、7=COMMON_MSG）
-    std::cout << "[包头解析] 转换后 msgType=" << header.msgType 
-              << "，dataLen=" << header.dataLen << std::endl;
-
-
-    // 2. 打印解析后的消息类型（验证是否正确）
-    std::cout << "[服务端解析] 客户端fd=" << clientFd
-              << "，msgType=" << header.msgType
-              << "，dataLen=" << header.dataLen << std::endl;
-
-    // 3. 后续按正确的msgType处理消息（USER_LIST_REQ/HEARTBEAT等）
-    switch (header.msgType) {
-        case USER_LIST_REQ:
-            handleUserListReq(clientFd); // 处理用户列表请求
-            break;
-        case HEARTBEAT:{
-            int userId = getUserIdByFd(clientFd); // 假设存在该函数，通过fd获取用户ID
-            if (userId != -1) {
-                handleHeartbeat(clientFd, userId); // 传入userId参数
-            }
-            break;
-        }
-        case COMMON_MSG:{
-            handleCommonMsg(clientFd, recvData); // 处理聊天消息
-            break;
-        }
-        default:{
-            std::cout << "未知消息类型：" << header.msgType << "，来自fd=" << clientFd << std::endl;
-            break;
-        }
-    }
-}
-
 // 处理单个客户端的消息（主循环调用）
 void handleClient(int clientFd) {
     char buf[4096];
@@ -257,8 +214,16 @@ void handleClient(int clientFd) {
             PacketHeader header;
             memcpy(&header, recvBuffer.data(), sizeof(PacketHeader));
 
+             // ===================== 新增：字节序转换 + 打印验证 =====================
+            uint32_t originalMsgType = header.msgType; // 保存原始网络字节序
+            uint32_t originalDataLen = header.dataLen;
+            header.msgType = ntohl(header.msgType);    // 网络字节序 → 主机字节序
+            header.dataLen = ntohl(header.dataLen);    // 必须转换，否则读取消息体长度错误
+            // =====================================================================
+
             // 检查数据包是否完整
             if (recvBuffer.size() < sizeof(PacketHeader) + header.dataLen) {
+                std::cout << "[handleClient解析] fd=" << clientFd << " 数据不完整，等待后续包" << std::endl;
                 break; // 数据不完整，等待后续包
             }
 
@@ -272,25 +237,30 @@ void handleClient(int clientFd) {
             recvBuffer.erase(recvBuffer.begin(), recvBuffer.begin() + sizeof(PacketHeader) + header.dataLen);
 
             // 处理不同类型的消息
+            // 处理不同类型的消息（使用转换后的 header.msgType！）
             switch (header.msgType) {
                 case LOGIN_REQ:
+                    std::cout << "[处理消息] fd=" << clientFd << " 登录请求" << std::endl;
                     handleLoginReq(clientFd, payload);
                     break;
                 case COMMON_MSG:
+                    std::cout << "[处理消息] fd=" << clientFd << " 聊天消息" << std::endl;
                     handleCommonMsg(clientFd, payload);
                     break;
                 case USER_LIST_REQ:
+                    std::cout << "[处理消息] fd=" << clientFd << " 用户列表请求" << std::endl;
                     handleUserListReq(clientFd);
                     break;
-                case HEARTBEAT:{
-                int userId = getUserIdByFd(clientFd);
-                if (userId != -1) {
-                    handleHeartbeat(clientFd, userId);
-                }
+                case HEARTBEAT: {
+                    std::cout << "[处理消息] fd=" << clientFd << " 心跳包" << std::endl;
+                    int userId = getUserIdByFd(clientFd);
+                    if (userId != -1) {
+                        handleHeartbeat(clientFd, userId); // 更新心跳时间，避免超时
+                    }
                     break;
-            }
+                }
                 default:
-                    std::cerr << "未知消息类型：" << header.msgType << "，来自fd=" << clientFd << std::endl;
+                    std::cerr << "[处理消息] fd=" << clientFd << " 未知消息类型（转换后）：" << header.msgType << std::endl;
                     break;
             }
         }
@@ -425,6 +395,9 @@ void heartbeatCheckThread() {
 }
 
 int main() {
+    // 新增：打印包头大小（必须是 8 字节！）
+    std::cout << "[调试] 服务端 PacketHeader 大小：" << sizeof(PacketHeader) << " 字节" << std::endl;
+    
     // 启动心跳检测线程
     std::thread heartbeatThread(heartbeatCheckThread);
     heartbeatThread.detach();

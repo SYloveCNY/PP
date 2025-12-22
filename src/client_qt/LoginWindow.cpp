@@ -5,6 +5,8 @@
 #include <string>   // 新增
 
 LoginWindow::LoginWindow(QWidget *parent) : QWidget(parent) {
+    // 新增：打印包头大小（必须和服务端一致，都是 8 字节！）
+    qDebug() << "[调试] 客户端 PacketHeader 大小：" << sizeof(PacketHeader);
     // 窗口配置
     setWindowTitle("聊天客户端 - 登录");
     setFixedSize(400, 300);
