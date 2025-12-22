@@ -27,7 +27,7 @@ private slots:
     void onSendClicked();       // 发送按钮点击槽函数
     void onServerReadyRead();   // 接收服务端TCP消息
     void onUdpReadyRead();      // 接收UDP点对点消息
-    void sendMessage(const QString &content);         // 发送消息核心函数
+    void sendMessage();         // 发送消息核心函数
     void onTextEdited();        // 新增：文本编辑框变化槽函数（声明）
     void onUserSelected(QListWidgetItem *item); // 新增：用户选择槽函数（声明）
     void sendHeartbeat(); // 发送心跳包的槽函数

@@ -289,10 +289,10 @@ void ChatWindow::onServerReadyRead() {
     // 第二步：读取数据到缓存（处理粘包/半包）
     // ==================================
     QByteArray newData = m_serverSocket->readAll();
-    if (newData.isEmpty()) {
-        qDebug() << "[onServerReadyRead] 收到TCP空包（正常连接保持，跳过）";
-        return;
-    }
+if (newData.isEmpty()) {
+    qDebug() << "[onServerReadyRead] 收到TCP空包（正常连接保持，跳过）";
+    return;
+}
 
     // 打印接收详情（十六进制+长度，方便抓包核对）
     qDebug() << "[onServerReadyRead] 接收数据：字节数=" << newData.size()
