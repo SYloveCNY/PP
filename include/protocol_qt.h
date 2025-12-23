@@ -42,4 +42,57 @@ inline bool sendPacket(QTcpSocket* socket, uint32_t msgType, const std::vector<c
     return sentLen == packet.size();
 }
 
+// 反序列化用户列表（客户端接收服务端响应）
+inline std::vector<UserInfo> deserializeUserListToVector(const std::vector<char>& data) {
+    std::vector<UserInfo> onlineUsers;
+    size_t offset = 0;
+
+    try {
+        // 1. 解析用户数量（网络字节序→主机字节序）
+        if (offset + sizeof(uint32_t) > data.size()) {
+            throw std::out_of_range("用户数量字段越界");
+        }
+        uint32_t userCount = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+        offset += sizeof(uint32_t);
+        std::cout << "[客户端] 解析到在线用户数量：" << userCount << std::endl;
+
+        // 2. 逐个解析用户信息
+        for (uint32_t i = 0; i < userCount; ++i) {
+            UserInfo user;
+            // 解析 userId（4字节）
+            if (offset + sizeof(int) > data.size()) throw std::out_of_range("userId字段越界");
+            user.userId = ntohl(*reinterpret_cast<const int*>(data.data() + offset));
+            offset += sizeof(int);
+
+            // 解析 nickname（长度4字节+内容）
+            if (offset + sizeof(uint32_t) > data.size()) throw std::out_of_range("nickname长度字段越界");
+            uint32_t nickLen = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+            offset += sizeof(uint32_t);
+            if (offset + nickLen > data.size()) throw std::out_of_range("nickname内容越界");
+            user.nickname = std::string(data.data() + offset, nickLen);
+            offset += nickLen;
+
+            // 解析 ip（长度4字节+内容）
+            if (offset + sizeof(uint32_t) > data.size()) throw std::out_of_range("ip长度字段越界");
+            uint32_t ipLen = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+            offset += sizeof(uint32_t);
+            if (offset + ipLen > data.size()) throw std::out_of_range("ip内容越界");
+            user.ip = std::string(data.data() + offset, ipLen);
+            offset += ipLen;
+
+            // 解析 dataPort（2字节）
+            if (offset + sizeof(uint16_t) > data.size()) throw std::out_of_range("dataPort字段越界");
+            user.dataPort = ntohs(*reinterpret_cast<const uint16_t*>(data.data() + offset));
+            offset += sizeof(uint16_t);
+
+            onlineUsers.push_back(user);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[客户端] 解析用户列表失败：" << e.what() << std::endl;
+        onlineUsers.clear();
+    }
+
+    return onlineUsers;
+}
+
 #endif // PROTOCOL_QT_H

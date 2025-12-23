@@ -4,52 +4,58 @@
 #include <QWidget>
 #include <QTcpSocket>
 #include <QUdpSocket>
-#include <QListWidget>
-#include <QTextEdit>
-#include <QPushButton>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QMessageBox>
-#include <QKeyEvent>
-#include <map>
-#include <QLabel>
+#include <QByteArray>
 #include <QTimer>
-#include "protocol_qt.h"   // 包含UserInfo、MsgType等协议定义
+#include <map>
+#include "UserInfo.h"  // 包含 UserInfo 结构体
+#include "protocol_qt.h"  // 包含 MsgType、PacketHeader 等枚举/结构体
 
-class ChatWindow : public QWidget {
+class QListWidget;
+class QTextEdit;
+class QLineEdit;
+class QPushButton;
+
+class ChatWindow : public QWidget
+{
     Q_OBJECT
+
 public:
-    // 构造函数：接收用户ID、昵称、TCP/UDP Socket（生命周期由ChatWindow接管）
-    ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSocket, QUdpSocket *udpSocket, QWidget *parent = nullptr);
-    virtual ~ChatWindow();  // 析构函数（QT父对象自动管理子控件，无需额外实现）
+    explicit ChatWindow(int userId, const QString& nickname, QTcpSocket* serverSocket, QUdpSocket* udpSocket = nullptr, QWidget* parent = nullptr);
+    ~ChatWindow();
 
 private slots:
-    void onSendClicked();       // 发送按钮点击槽函数
-    void onServerReadyRead();   // 接收服务端TCP消息（核心数据接收）
-    void onUdpReadyRead();      // 接收UDP消息（预留扩展）
-    void sendMessage(const QString& content);  // 发送消息核心逻辑
-    void onTextEdited();        // 输入框文本变化（控制发送按钮启用/禁用）
-    void onUserSelected(QListWidgetItem *item); // 选择在线用户（更新目标ID）
-    void sendHeartbeat();       // 定时发送心跳包（维持连接）
+    void onServerReadyRead();       // 接收服务端数据
+    void onDisconnected();          // 处理断开连接
+    void sendHeartbeat();           // 发送心跳包
+    void sendMessage(const QString& content);  // 发送聊天消息
 
 private:
-    void keyPressEvent(QKeyEvent *event) override; // 重写键盘事件（回车发送）
-    void showMessage(const QString &sender, const QString &content); // 显示聊天消息
-    void updateOnlineUsers(const std::map<int, UserInfo> &users); // 更新在线用户列表UI
+    void initUI();                  // 初始化UI
+    void initTimers();              // 初始化定时器
+    void bindSocketSignals();       // 绑定Socket信号槽
+    void sendUserListReq();         // 发送用户列表请求
+    void updateOnlineUsers(const std::map<int, UserInfo>& onlineUsers);  // 更新用户列表UI
+    void showMessage(const QString& sender, const QString& content);     // 显示聊天消息
+    void handleMessage(MsgType msgType, const std::vector<char>& payload);  // 处理不同类型消息
 
-    // 成员变量（与cpp实现严格对应）
-    int m_userId;               // 当前登录用户ID（服务端分配）
-    QString m_nickname;         // 当前用户昵称
-    int m_selectedUserId = 0;   // 选中的目标用户ID（0=广播，默认值）
-    QTcpSocket *m_serverSocket; // TCP Socket（与服务端通信）
-    QUdpSocket *m_udpSocket;    // UDP Socket（预留点对点通信）
-    QListWidget *m_chatList;    // 聊天记录显示列表
-    QTextEdit *m_inputEdit;     // 消息输入框（支持多行输入）
-    QPushButton *m_sendBtn;     // 发送按钮
-    QListWidget *m_userList;    // 在线用户列表UI
-    QByteArray m_recvBuffer;    // TCP接收缓存（处理粘包/半包）
-    std::map<int, UserInfo> m_onlineUsers; // 本地缓存在线用户列表
-    QTimer *m_heartbeatTimer;   // 心跳定时器（3秒一次）
+private:
+    int m_userId;                   // 当前登录用户ID
+    QString m_nickname;             // 当前登录用户昵称
+    QTcpSocket* m_serverSocket;     // TCP连接Socket（与服务端）
+    QUdpSocket* m_udpSocket;        // UDP Socket（点对点通信，可选）
+    QByteArray m_recvBuffer;        // 接收数据缓存（处理粘包/半包）
+    std::map<int, UserInfo> m_onlineUsers;  // 在线用户列表（key=userId）
+    int m_selectedUserId;           // 选中的目标用户ID（0=广播）
+
+    // UI控件
+    QListWidget* m_userListWidget;  // 在线用户列表控件
+    QTextEdit* m_chatDisplay;       // 聊天显示区域
+    QLineEdit* m_msgInput;          // 消息输入框
+    QPushButton* m_sendBtn;         // 发送按钮
+
+    // 定时器
+    QTimer* m_heartbeatTimer;       // 心跳定时器
+    QTimer* m_userListTimeoutTimer; // 用户列表请求超时定时器
 };
 
 #endif // CHATWINDOW_H

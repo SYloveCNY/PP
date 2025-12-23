@@ -13,15 +13,16 @@
 #include <QTcpSocket>  // 客户端sendPacket需要QT Socket头文件
 
 // 定义MsgType（建议用uint32_t避免枚举字节大小问题）
-using MsgType = uint32_t;
-const MsgType LOGIN_REQ = 1;
-const MsgType LOGIN_RSP = 2;
-const MsgType USER_ONLINE_NOTIFY = 11;
-const MsgType USER_OFFLINE_NOTIFY = 12;
-const MsgType USER_LIST_REQ = 3;
-const MsgType USER_LIST_RSP = 4;
-const MsgType HEARTBEAT = 10;
-const MsgType COMMON_MSG = 20; // 新增：普通聊天消息（客户端需要）
+enum class MsgType : uint32_t {
+    LOGIN_REQ = 1,        // 登录请求
+    LOGIN_RSP = 2,        // 登录响应
+    USER_LIST_REQ = 3,    // 用户列表请求
+    USER_LIST_RSP = 4,    // 用户列表响应（必须添加！）
+    COMMON_MSG = 5,       // 普通消息
+    USER_ONLINE_NOTIFY = 6,// 用户上线通知
+    USER_OFFLINE_NOTIFY =7,// 用户下线通知
+    HEARTBEAT = 10        // 心跳包
+};
 
 // 数据包头部
 struct PacketHeader {

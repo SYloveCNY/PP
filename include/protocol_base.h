@@ -11,29 +11,30 @@
 #include <cstdint>
 #include <arpa/inet.h>
 #include <cstring> // strerror依赖
+#include "UserInfo.h"
 
 // ========== 基础类型定义（无QT） ==========
-using MsgType = uint32_t;
-// 协议常量（删除MsgType::前缀，直接用常量）
-const uint32_t LOGIN_REQ = 1;
-const uint32_t LOGIN_RSP = 2;
-const uint32_t USER_ONLINE_NOTIFY = 11;
-const uint32_t USER_OFFLINE_NOTIFY = 12;
-const uint32_t USER_LIST_REQ = 3;
-const uint32_t USER_LIST_RSP = 4;
-const uint32_t HEARTBEAT = 10;
-const uint32_t COMMON_MSG = 20;
+enum class MsgType : uint32_t {
+    LOGIN_REQ = 1,        // 登录请求
+    LOGIN_RSP = 2,        // 登录响应
+    USER_LIST_REQ = 3,    // 用户列表请求
+    USER_LIST_RSP = 4,    // 用户列表响应（必须添加！）
+    COMMON_MSG = 5,       // 普通消息
+    USER_ONLINE_NOTIFY = 6,// 用户上线通知
+    USER_OFFLINE_NOTIFY =7,// 用户下线通知
+    HEARTBEAT = 10        // 心跳包
+};
 
 // 数据包头部（纯C++结构体）
 struct PacketHeader {
-    MsgType msgType;
+    uint32_t msgType;
     uint32_t dataLen;
 };
 
 // 核心结构体（纯C++）
 struct LoginReq {
     std::string nickname;
-    std::vector<char> avatar;
+    std::string avatar;
     uint16_t dataPort;
 };
 
@@ -42,16 +43,6 @@ struct LoginRsp {
     int userId;
     std::string msg;
     std::string nickname;
-};
-
-struct UserInfo {
-    int userId;
-    std::string nickname;
-    std::vector<char> avatar;
-    uint16_t dataPort;
-    std::string ip;
-    int managePort;
-    std::chrono::system_clock::time_point lastHeartbeatTime; 
 };
 
 struct CommonMsg {
@@ -66,69 +57,64 @@ inline bool isValidLength(uint32_t len, size_t maxAllowed = 1024 * 1024) {
     return len <= maxAllowed && len != 0xFFFFFFFF;
 }
 
-// ========== 基础序列化/反序列化（纯C++） ==========
-// 序列化字符串：先存长度（uint32_t，网络字节序），再存内容
+// 序列化 std::string：4字节长度（网络字节序）+ 字符串内容
 inline std::vector<char> serializeString(const std::string& str) {
     std::vector<char> data;
-    uint32_t len = static_cast<uint32_t>(str.size());
-    uint32_t networkLen = htonl(len); // 长度转换为网络字节序
-    // 写入长度
-    data.insert(data.end(), reinterpret_cast<char*>(&networkLen),
-                reinterpret_cast<char*>(&networkLen) + sizeof(uint32_t));
-    // 写入字符串内容
-    if (len > 0) {
-        data.insert(data.end(), str.begin(), str.end());
-    }
+    uint32_t len = htonl(static_cast<uint32_t>(str.size()));
+    
+    // 修复：用「起始指针+结束指针」构成迭代器范围
+    data.insert(data.end(), reinterpret_cast<char*>(&len), 
+                reinterpret_cast<char*>(&len) + sizeof(uint32_t));
+    // 字符串内容：str.data()（起始） + str.data()+str.size()（结束）
+    data.insert(data.end(), str.data(), str.data() + str.size());
+    
     return data;
 }
 
-// 反序列化字符串：先读长度（网络字节序→主机字节序），再读内容
+// 反序列化 std::string：先读4字节长度，再读对应长度的内容
 inline std::string deserializeString(const std::vector<char>& data, size_t& offset) {
     if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("string length field out of bounds");
+        throw std::out_of_range("string length overflow");
     }
     // 读取长度并转换为主机字节序
-    uint32_t networkLen = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    uint32_t len = ntohl(networkLen);
+    uint32_t len = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
     offset += sizeof(uint32_t);
 
-    // 读取字符串内容
     if (offset + len > data.size()) {
-        throw std::out_of_range("string content field out of bounds");
+        throw std::out_of_range("string content overflow");
     }
-    std::string str(data.begin() + offset, data.begin() + offset + len);
+    // 读取字符串内容（data.data()+offset 是起始指针，长度 len）
+    std::string str(data.data() + offset, len);
     offset += len;
     return str;
 }
 
+// 序列化 std::vector<char>：4字节长度（网络字节序）+ 向量内容
 inline std::vector<char> serializeVector(const std::vector<char>& vec) {
     std::vector<char> data;
-    uint32_t len = static_cast<uint32_t>(vec.size());
-    len = htonl(len);
-    data.insert(data.end(), reinterpret_cast<const char*>(&len),
-                reinterpret_cast<const char*>(&len) + sizeof(uint32_t));
-    if (len > 0) {
-        data.insert(data.end(), vec.begin(), vec.end());
-    }
+    uint32_t len = htonl(static_cast<uint32_t>(vec.size()));
+    
+    // 修复：用「起始指针+结束指针」构成迭代器范围
+    data.insert(data.end(), reinterpret_cast<char*>(&len), 
+                reinterpret_cast<char*>(&len) + sizeof(uint32_t));
+    // 向量内容：vec.data()（起始） + vec.data()+vec.size()（结束）
+    data.insert(data.end(), vec.data(), vec.data() + vec.size());
+    
     return data;
 }
 
+// 反序列化 std::vector<char>
 inline std::vector<char> deserializeVector(const std::vector<char>& data, size_t& offset) {
     if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("Vector length field out of bounds");
+        throw std::out_of_range("vector length overflow");
     }
-    uint32_t len = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    len = ntohl(len);
+    uint32_t len = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
     offset += sizeof(uint32_t);
-    
-    if (!isValidLength(len) || (offset + len) > data.size()) {
-        throw std::length_error("Invalid vector length: " + std::to_string(len));
+
+    if (offset + len > data.size()) {
+        throw std::out_of_range("vector content overflow");
     }
-    
-    std::vector<char> vec;
-    if (len > 0) {
-        vec.assign(data.data() + offset, data.data() + offset + len);
-    }
+    std::vector<char> vec(data.begin() + offset, data.begin() + offset + len);
     offset += len;
     return vec;
 }
@@ -137,32 +123,24 @@ inline std::vector<char> deserializeVector(const std::vector<char>& data, size_t
 inline std::vector<char> serializeLoginReq(const LoginReq& req) {
     std::vector<char> data;
     auto nicknameData = serializeString(req.nickname);
+    auto avatarData = serializeString(req.avatar);  // 修复：用 serializeString（string类型）
+    uint16_t portNet = htons(req.dataPort);
+
     data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    auto avatarData = serializeVector(req.avatar);
     data.insert(data.end(), avatarData.begin(), avatarData.end());
-    uint16_t port = htons(req.dataPort);
-    data.insert(data.end(), reinterpret_cast<const char*>(&port),
-                reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
+    // 端口号也修复 insert 格式（如果之前没修）
+    data.insert(data.end(), reinterpret_cast<char*>(&portNet), 
+                reinterpret_cast<char*>(&portNet) + sizeof(uint16_t));
     return data;
 }
 
 inline LoginReq deserializeLoginReq(const std::vector<char>& data) {
     LoginReq req;
     size_t offset = 0;
-    try {
-        req.nickname = deserializeString(data, offset);
-        req.avatar = deserializeVector(data, offset);
-        
-        if (offset + sizeof(uint16_t) > data.size()) {
-            throw std::out_of_range("DataPort field out of bounds");
-        }
-        uint16_t port = *reinterpret_cast<const uint16_t*>(data.data() + offset);
-        req.dataPort = ntohs(port);
-        offset += sizeof(uint16_t);
-    } catch (const std::exception& e) {
-        std::cerr << "Deserialize LoginReq failed: " << e.what() << std::endl;
-        req = LoginReq{};
-    }
+    req.nickname = deserializeString(data, offset);
+    req.avatar = deserializeString(data, offset);  // 修复：用 deserializeString（string类型）
+    req.dataPort = ntohs(*reinterpret_cast<const uint16_t*>(data.data() + offset));
+    offset += sizeof(uint16_t);
     return req;
 }
 
@@ -204,90 +182,122 @@ inline LoginRsp deserializeLoginRsp(const std::vector<char>& data) {
     return rsp;
 }
 
+// 序列化 UserInfo（含 avatar 字段，std::string 类型）
 inline std::vector<char> serializeUserInfo(const UserInfo& user) {
     std::vector<char> data;
-    // 序列化userId（修正insert参数）
-    data.insert(data.end(), 
-               reinterpret_cast<const char*>(&user.userId), 
-               reinterpret_cast<const char*>(&user.userId) + sizeof(int));
-    // 序列化昵称
-    auto nicknameData = serializeString(user.nickname);
-    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    // 序列化头像
-    auto avatarData = serializeVector(user.avatar);
-    data.insert(data.end(), avatarData.begin(), avatarData.end());
-    // 序列化dataPort（转网络字节序，修正insert参数）
-    uint16_t port = htons(user.dataPort);
-    data.insert(data.end(), 
-               reinterpret_cast<const char*>(&port), 
-               reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
-    // 序列化IP
-    auto ipData = serializeString(user.ip);
-    data.insert(data.end(), ipData.begin(), ipData.end());
-    // 序列化managePort（修正insert参数）
-    data.insert(data.end(), 
-               reinterpret_cast<const char*>(&user.managePort), 
-               reinterpret_cast<const char*>(&user.managePort) + sizeof(int));
+
+    // 1. 序列化 userId（4字节，网络字节序）
+    int userIdNet = htonl(user.userId);
+    data.insert(data.end(), reinterpret_cast<char*>(&userIdNet), 
+                reinterpret_cast<char*>(&userIdNet) + sizeof(int));
+
+    // 2. 序列化 nickname（长度4字节+内容，std::string 专用）
+    uint32_t nickLen = htonl(static_cast<uint32_t>(user.nickname.size()));
+    data.insert(data.end(), reinterpret_cast<char*>(&nickLen), 
+                reinterpret_cast<char*>(&nickLen) + sizeof(uint32_t));
+    data.insert(data.end(), user.nickname.begin(), user.nickname.end());
+
+    // 3. 序列化 avatar（长度4字节+内容，std::string 专用，与 nickname 逻辑一致）
+    uint32_t avatarLen = htonl(static_cast<uint32_t>(user.avatar.size()));
+    data.insert(data.end(), reinterpret_cast<char*>(&avatarLen), 
+                reinterpret_cast<char*>(&avatarLen) + sizeof(uint32_t));
+    data.insert(data.end(), user.avatar.begin(), user.avatar.end());
+
+    // 4. 序列化 ip（长度4字节+内容）
+    uint32_t ipLen = htonl(static_cast<uint32_t>(user.ip.size()));
+    data.insert(data.end(), reinterpret_cast<char*>(&ipLen), 
+                reinterpret_cast<char*>(&ipLen) + sizeof(uint32_t));
+    data.insert(data.end(), user.ip.begin(), user.ip.end());
+
+    // 5. 序列化 dataPort（2字节，网络字节序）
+    uint16_t portNet = htons(static_cast<uint16_t>(user.dataPort));
+    data.insert(data.end(), reinterpret_cast<char*>(&portNet), 
+                reinterpret_cast<char*>(&portNet) + sizeof(uint16_t));
+
     return data;
 }
 
+// 反序列化 UserInfo（含 avatar 字段，std::string 类型）
 inline UserInfo deserializeUserInfo(const std::vector<char>& data, size_t& offset) {
     UserInfo user;
-    if (offset + sizeof(int) > data.size()) {
-        throw std::out_of_range("UserID field out of bounds");
+    try {
+        // 1. 解析 userId
+        if (offset + sizeof(int) > data.size()) throw std::out_of_range("userId out of bounds");
+        user.userId = ntohl(*reinterpret_cast<const int*>(data.data() + offset));
+        offset += sizeof(int);
+
+        // 2. 解析 nickname（std::string 专用）
+        if (offset + sizeof(uint32_t) > data.size()) throw std::out_of_range("nickname len out of bounds");
+        uint32_t nickLen = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+        offset += sizeof(uint32_t);
+        if (offset + nickLen > data.size()) throw std::out_of_range("nickname content out of bounds");
+        user.nickname = std::string(data.data() + offset, nickLen);
+        offset += nickLen;
+
+        // 3. 解析 avatar（std::string 专用，与 nickname 逻辑一致）
+        if (offset + sizeof(uint32_t) > data.size()) throw std::out_of_range("avatar len out of bounds");
+        uint32_t avatarLen = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+        offset += sizeof(uint32_t);
+        if (offset + avatarLen > data.size()) throw std::out_of_range("avatar content out of bounds");
+        user.avatar = std::string(data.data() + offset, avatarLen);  // 直接转换为 std::string
+        offset += avatarLen;
+
+        // 4. 解析 ip
+        if (offset + sizeof(uint32_t) > data.size()) throw std::out_of_range("ip len out of bounds");
+        uint32_t ipLen = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+        offset += sizeof(uint32_t);
+        if (offset + ipLen > data.size()) throw std::out_of_range("ip content out of bounds");
+        user.ip = std::string(data.data() + offset, ipLen);
+        offset += ipLen;
+
+        // 5. 解析 dataPort
+        if (offset + sizeof(uint16_t) > data.size()) throw std::out_of_range("dataPort out of bounds");
+        user.dataPort = ntohs(*reinterpret_cast<const uint16_t*>(data.data() + offset));
+        offset += sizeof(uint16_t);
+
+        // 服务端专用字段初始化
+        user.managePort = 0;
+        user.lastHeartbeatTime = 0;
+    } catch (const std::exception& e) {
+        std::cerr << "deserializeUserInfo failed: " << e.what() << std::endl;
+        throw;
     }
-    user.userId = *reinterpret_cast<const int*>(data.data() + offset);
-    offset += sizeof(int);
-    
-    user.nickname = deserializeString(data, offset);
-    user.avatar = deserializeVector(data, offset);
-    
-    if (offset + sizeof(uint16_t) > data.size()) {
-        throw std::out_of_range("DataPort field out of bounds");
-    }
-    uint16_t port = *reinterpret_cast<const uint16_t*>(data.data() + offset);
-    user.dataPort = ntohs(port);
-    offset += sizeof(uint16_t);
-    
-    user.ip = deserializeString(data, offset);
-    
-    if (offset + sizeof(int) > data.size()) {
-        throw std::out_of_range("ManagePort field out of bounds");
-    }
-    user.managePort = *reinterpret_cast<const int*>(data.data() + offset);
-    offset += sizeof(int);
     return user;
 }
 
-inline std::vector<char> serializeUserList(const std::map<int, UserInfo>& users);
-
-// 重载：无offset的UserInfo反序列化
-inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
-    size_t offset = 0;
-    return deserializeUserInfo(data, offset);
+// 序列化用户列表
+inline std::vector<char> serializeUserList(const std::map<int, UserInfo>& onlineUsers) {
+    std::vector<char> data;
+    // 1. 序列化在线用户数量（转网络字节序）
+    uint32_t userCount = htonl(static_cast<uint32_t>(onlineUsers.size()));
+    data.insert(data.end(), reinterpret_cast<char*>(&userCount), 
+                reinterpret_cast<char*>(&userCount) + sizeof(uint32_t));
+    
+    // 2. 逐个序列化每个用户的信息（依赖 UserInfo 序列化函数）
+    for (const auto& [userId, user] : onlineUsers) {
+        // 序列化 UserInfo（如果没有该函数，先添加下面的 serializeUserInfo）
+        std::vector<char> userData = serializeUserInfo(user);
+        data.insert(data.end(), userData.begin(), userData.end());
+    }
+    return data;
 }
 
-inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data) {
-    std::map<int, UserInfo> users;
-    if (data.size() < sizeof(uint32_t)) {
-        throw std::runtime_error("用户列表数据过短");
-    }
-
-    // 关键修复：网络字节序→主机字节序（必须调用ntohl）
-    uint32_t networkCount;
-    memcpy(&networkCount, data.data(), sizeof(uint32_t));
-    uint32_t userCount = ntohl(networkCount); // 漏了这行会导致解析失败！
-
-    size_t offset = sizeof(uint32_t);
-    for (uint32_t i = 0; i < userCount; ++i) {
-        if (offset + sizeof(UserInfo) > data.size()) { // 或根据实际序列化逻辑判断
-            throw std::runtime_error("用户数据不完整");
+// 反序列化用户列表
+inline std::map<int, UserInfo> deserializeUserListToMap(const std::vector<char>& data) {
+    std::map<int, UserInfo> userMap;
+    size_t offset = 0;
+    try {
+        uint32_t userCount = ntohl(*reinterpret_cast<const uint32_t*>(data.data() + offset));
+        offset += sizeof(uint32_t);
+        for (uint32_t i = 0; i < userCount; ++i) {
+            UserInfo user = deserializeUserInfo(data, offset);
+            userMap[user.userId] = user;
         }
-        // 解析单个用户信息（复用已有的deserializeUserInfo）
-        UserInfo user = deserializeUserInfo(data, offset);
-        users[user.userId] = user;
+    } catch (const std::exception& e) {
+        std::cerr << "deserializeUserList failed: " << e.what() << std::endl;
+        userMap.clear();
     }
-    return users;
+    return userMap;
 }
 
 inline std::vector<char> serializeCommonMsg(const CommonMsg& msg) {

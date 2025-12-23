@@ -86,7 +86,7 @@ void LoginWindow::onLoginClicked() {
         }
     }
 
-    bool success = sendPacket(serverSocket, LOGIN_REQ, payload);
+    bool success = sendPacket(serverSocket, static_cast<uint32_t>(MsgType::LOGIN_REQ), payload);
     if (!success) {
         QMessageBox::critical(this, "错误", "发送登录请求失败！");
     }
@@ -109,7 +109,8 @@ void LoginWindow::onReadyRead() {
     uint32_t dataLen = ntohl(header.dataLen);
 
     // 只处理登录响应（LOGIN_RSP）
-    if (msgType != LOGIN_RSP) {
+    if (msgType != static_cast<uint32_t>(MsgType::LOGIN_RSP)) {  // 转为 uint32_t 比较
+        std::cerr << "未知消息类型：" << msgType << std::endl;
         return;
     }
 
