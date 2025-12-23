@@ -1,37 +1,48 @@
-cmake_minimum_required(VERSION 3.16)
-project(PP VERSION 1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.16)  # Qt6 要求 CMake 最低 3.16
+project(ChatServerClient)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ====================== 服务端（纯C++，无Qt依赖）======================
+# -------------------------- 服务端配置（不变）--------------------------
 add_executable(chat_server
     src/server/server.cpp
-    include/protocol.h
+    include/protocol_base.h
 )
-# 服务端仅依赖pthread（多线程），无Qt依赖
-target_include_directories(chat_server PUBLIC include)
-target_link_libraries(chat_server PRIVATE pthread)
 
-# ====================== Qt客户端（单独依赖Qt）======================
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
-qt_standard_project_setup()
+target_link_libraries(chat_server PUBLIC pthread)
 
-qt_add_executable(chat_client_qt
-    src/client_qt/main.cpp
-    src/client_qt/LoginWindow.cpp
+target_include_directories(chat_server PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/include/json
+)
+
+# -------------------------- 客户端配置（适配 Qt6）--------------------------
+# 1. 查找 Qt6 组件（Qt6 组件名称与 Qt5 基本一致，部分调整）
+find_package(Qt6 COMPONENTS Widgets Network REQUIRED)
+
+# 2. 启用 Qt 自动工具（UI/ moc/ 资源文件）
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+
+# 3. 客户端源文件（包含入口文件 main.cpp）
+add_executable(chat_client_qt
+    src/client_qt/ChatWindow.h
     src/client_qt/ChatWindow.cpp
-    include/protocol.h
-)
-target_include_directories(chat_client_qt PUBLIC include)
-target_link_libraries(chat_client_qt PRIVATE
-    Qt6::Core
-    Qt6::Widgets
-    Qt6::Network
-    pthread
+    src/client_qt/LoginWindow.h
+    src/client_qt/LoginWindow.cpp
+    src/client_qt/main.cpp  # 客户端入口，必须包含
+    include/protocol_base.h
 )
 
-# 安装路径
-install(TARGETS chat_server chat_client_qt
-    RUNTIME DESTINATION bin
+# 4. 链接 Qt6 库（Qt6::Widgets 对应界面，Qt6::Network 对应网络）
+target_link_libraries(chat_client_qt PUBLIC 
+    Qt6::Widgets 
+    Qt6::Network
+)
+
+# 5. 包含头文件目录
+target_include_directories(chat_client_qt PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
 )
