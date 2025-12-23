@@ -359,43 +359,4 @@ inline CommonMsg deserializeCommonMsg(const std::vector<char>& data) {
     return msg;
 }
 
-// ========== 服务端纯C++ sendPacket ==========
-
-inline bool sendPacket(int targetFd, uint32_t msgType, const std::vector<char>& payload) {
-    try {
-        // 1. 构造 PacketHeader（确保字段正确）
-        PacketHeader header;
-        header.msgType = msgType; // 接收 uint32_t，MsgType 枚举可隐式转换
-        header.dataLen = static_cast<uint32_t>(payload.size());
-
-        // 2. 构建完整发送缓冲区（包头 +  payload）
-        std::vector<char> sendData(sizeof(PacketHeader) + payload.size());
-        // 复制包头（memcpy 避免结构体对齐问题）
-        memcpy(sendData.data(), &header, sizeof(PacketHeader));
-        // 复制 payload（若有数据）
-        if (!payload.empty()) {
-            memcpy(sendData.data() + sizeof(PacketHeader), payload.data(), payload.size());
-        }
-
-        // 3. 循环 send，确保所有数据发送完成（TCP 可能分批发送）
-        ssize_t totalSent = 0;
-        ssize_t dataLen = sendData.size();
-        while (totalSent < dataLen) {
-            ssize_t sent = send(targetFd, sendData.data() + totalSent, dataLen - totalSent, 0);
-            if (sent == -1) {
-                std::cerr << "[sendPacket] 发送失败：fd=" << targetFd << "，错误：" << strerror(errno) << std::endl;
-                return false;
-            }
-            totalSent += sent;
-        }
-
-        // 4. 调试日志（可选，方便排查）
-        // std::cout << "[sendPacket] 成功：fd=" << targetFd << "，消息类型：" << msgType << "，总字节数：" << dataLen << std::endl;
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "[sendPacket] 异常：" << e.what() << std::endl;
-        return false;
-    }
-}
-
 #endif // PROTOCOL_BASE_H

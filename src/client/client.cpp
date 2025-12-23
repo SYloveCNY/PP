@@ -176,9 +176,10 @@ void setNonBlocking(int fd) {
 // 发送完整数据包（头部+数据）
 bool sendPacket(int fd, MsgType msgType, const vector<char>& data) {
     PacketHeader header;
-    header.msgType = msgType;
-    header.dataLen = data.size();
-
+    // 关键修复：转换为网络字节序（大端）
+    header.msgType = htonl(msgType);  // 新增字节序转换
+    header.dataLen = htonl(data.size());  // 新增字节序转换
+    
     // 发送头部
     if (send(fd, &header, sizeof(PacketHeader), 0) != sizeof(PacketHeader)) {
         perror("send header failed");

@@ -3,6 +3,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QDebug>
+#include <QAbstractSocket>
 #include "protocol_qt.h"
 
 // 构造函数（完整初始化+信号绑定）
@@ -103,8 +104,8 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
     // 关键3：登录后主动请求在线用户列表（检查连接状态）
     if (m_serverSocket->state() == QAbstractSocket::ConnectedState) {
         PacketHeader header;
-        header.msgType = htonl(USER_LIST_REQ); // 转网络字节序（修复之前遗漏）
-        header.dataLen = htonl(0);             // 数据长度=0（无payload）
+        header.msgType = htonl(USER_LIST_REQ);
+        header.dataLen = htonl(0);
         std::vector<char> sendData;
         sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
                         reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
@@ -115,9 +116,14 @@ ChatWindow::ChatWindow(int userId, const QString &nickname, QTcpSocket *serverSo
         } else {
             showMessage("系统", "正在获取在线用户列表...");
             qDebug() << "[初始化] 已发送USER_LIST_REQ，字节数：" << bytesSent;
+
+            // 新增：5秒超时未收到响应提示
+            QTimer::singleShot(5000, this, [this]() {
+                if (m_onlineUsers.empty()) {
+                    showMessage("系统", "获取在线用户列表超时，请检查网络连接！");
+                }
+            });
         }
-    } else {
-        showMessage("系统", "连接未建立，无法获取在线用户列表！");
     }
 }
 
@@ -195,42 +201,47 @@ void ChatWindow::sendMessage(const QString &content) {
         msg.fromNickname = m_nickname.toStdString();
         msg.content = content.toStdString();
 
-        // 序列化消息体（与服务端deserializeCommonMsg顺序一致）
         std::vector<char> payload = serializeCommonMsg(msg);
-
-        // 构造包头（必须转网络字节序）
         PacketHeader header;
         header.msgType = htonl(COMMON_MSG);
         header.dataLen = htonl(static_cast<uint32_t>(payload.size()));
 
-        // 构造完整数据包
         std::vector<char> sendData;
         sendData.insert(sendData.end(), reinterpret_cast<char*>(&header),
                         reinterpret_cast<char*>(&header) + sizeof(PacketHeader));
         sendData.insert(sendData.end(), payload.begin(), payload.end());
 
-        // 发送数据
-        qint64 sent = m_serverSocket->write(sendData.data(), sendData.size());
-        if (sent == -1) {
-            throw std::runtime_error("Socket写入失败：" + m_serverSocket->errorString().toStdString());
-        }
+        // 👇 彻底删除这行导致编译错误的代码（waitForBytesWritten已自带超时）
+        // m_serverSocket->setSocketOption(QAbstractSocket::SendTimeoutOption, QVariant(5000));
 
-        // 本地显示自己的消息
-        QString sender = "我";
-        if (m_selectedUserId == 0) {
-            sender += "（广播）";
-        } else {
-            // 查找目标用户昵称（优化显示）
-            auto it = m_onlineUsers.find(m_selectedUserId);
-            if (it != m_onlineUsers.end()) {
-                sender += QString("（发给%1）").arg(QString::fromStdString(it->second.nickname));
-            } else {
-                sender += QString("（发给ID:%1）").arg(m_selectedUserId);
+        // 确保数据完整发送（原有逻辑不变，waitForBytesWritten已控制超时）
+        qint64 totalBytes = sendData.size();
+        qint64 bytesSent = 0;
+        while (bytesSent < totalBytes) {
+            qint64 sent = m_serverSocket->write(sendData.data() + bytesSent, totalBytes - bytesSent);
+            if (sent == -1) {
+                throw std::runtime_error("Socket写入失败：" + m_serverSocket->errorString().toStdString());
+            }
+            bytesSent += sent;
+
+            // 等待数据写入内核缓冲区（5秒超时，已覆盖发送超时需求）
+            if (!m_serverSocket->waitForBytesWritten(5000)) {
+                throw std::runtime_error("发送超时：" + m_serverSocket->errorString().toStdString());
             }
         }
-        showMessage(sender, content);
 
-        qDebug() << "[消息发送] 成功：内容=" << content << "，目标ID=" << m_selectedUserId << "，总字节数=" << sendData.size();
+        // 本地显示消息（原有逻辑不变）
+        QString sender = "我";
+        if (m_selectedUserId == 0) sender += "（广播）";
+        else {
+            auto it = m_onlineUsers.find(m_selectedUserId);
+            sender += it != m_onlineUsers.end() 
+                      ? QString("（发给%1）").arg(QString::fromStdString(it->second.nickname))
+                      : QString("（发给ID:%1）").arg(m_selectedUserId);
+        }
+        showMessage(sender, content);
+        qDebug() << "[消息发送] 成功：总字节数=" << sendData.size();
+
     } catch (const std::exception& e) {
         QString errMsg = "发送消息失败：" + QString::fromStdString(e.what());
         showMessage("系统", errMsg);
@@ -322,6 +333,13 @@ void ChatWindow::onServerReadyRead() {
             qDebug() << "[数据包不完整] 缓存长度：" << m_recvBuffer.size()
                      << "，需要长度：" << totalPacketLen << "，等待后续数据";
             break;
+        }
+
+        // 新增：检查消息类型是否合法
+        if (header.msgType < LOGIN_REQ || header.msgType > HEARTBEAT) {
+            qDebug() << "[无效消息] 收到非法msgType：" << header.msgType << "，丢弃数据包";
+            m_recvBuffer.remove(0, totalPacketLen);
+            continue;
         }
 
         // 提取payload
@@ -419,9 +437,6 @@ void ChatWindow::onServerReadyRead() {
 // 显示聊天消息（带时间戳，自动滚动到底部）
 void ChatWindow::showMessage(const QString &sender, const QString &content) {
     qDebug() << "[消息显示] 发送者：" << sender << "，内容：" << content;
-
-    // 临时弹窗（确认消息接收，后续可删除）
-    QMessageBox::information(this, "收到消息", QString("%1：%2").arg(sender, content));
 
     // 格式化消息（时间戳+发送者+内容）
     QString timeStr = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
