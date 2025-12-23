@@ -1,139 +1,138 @@
 #include "ChatWindow.h"
 #include "ui_ChatWindow.h"
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <iostream>
 #include <ostream>
-#include <QtEndian>  // 必须添加：qToBigEndian/qFromBigEndian 依赖
+#include <QtEndian>    // Qt跨平台字节序函数（替代htonl/ntohl）
+#include <arpa/inet.h> // 备用：如果Qt函数不生效，htonl/ntohl的头文件
+#include <algorithm>   // 遍历map转vector需要
 
 ChatWindow::ChatWindow(QWidget *parent) :
     QWidget(parent),
-    ui(new Ui::ChatWindow),  // 初始化UI成员
-    m_onlineUserList(nullptr),
+    ui(new Ui::ChatWindow),
     m_userId(-1),
-    m_serverSocket(nullptr)
+    m_serverSocket(nullptr),
+    m_onlineUserList(nullptr),
+    m_recvBuffer(QByteArray()) // 初始化粘包缓存
 {
     ui->setupUi(this);
-    // 绑定在线用户列表UI（QGroupBox中的QListWidget）
+    // 绑定在线用户列表UI控件（对应ChatWindow.ui中的listWidget_onlineUsers）
     m_onlineUserList = ui->listWidget_onlineUsers;
 }
 
 ChatWindow::~ChatWindow() {
-    delete ui;  // 释放UI资源
+    delete ui; // 释放UI资源
 }
 
-// 设置登录信息：登录成功后调用
+// 登录成功后设置用户信息和Socket
 void ChatWindow::setLoginInfo(int userId, const QString& nickname, QTcpSocket* serverSocket) {
     m_userId = userId;
     m_nickname = nickname;
     m_serverSocket = serverSocket;
 
-    // 绑定socket的readyRead信号（接收服务端数据）
+    // 绑定Socket的readyRead信号（接收服务端数据）
     connect(m_serverSocket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
-
-    // 登录成功后，发送在线用户列表请求
-    sendUserListReq();
+    
+    // 登录成功后立即发送在线用户列表请求
+    onLoginSuccess();
 }
 
-// 发送在线用户列表请求（直接用 qToBigEndian，无需命名空间）
-void ChatWindow::sendUserListReq() {
+// 登录成功后发送USER_LIST_REQ（修复枚举前缀+字节序函数）
+void ChatWindow::onLoginSuccess() {
     PacketHeader header;
-    header.msgType = static_cast<uint32_t>(MsgType::USER_LIST_REQ);
-    header.dataLen = 0;  // 无JSON数据
-
-    // 转换为网络字节序（直接调用，无需 Qt:: 前缀）
-    PacketHeader netHeader;
-    netHeader.msgType = qToBigEndian(header.msgType);
-    netHeader.dataLen = qToBigEndian(header.dataLen);
-
+    // 1. 修复枚举前缀：加MsgType::，强转uint32_t
+    // 2. 改用Qt跨平台函数qToBigEndian（替代htonl，无需系统头文件）
+    header.msgType = qToBigEndian(static_cast<uint32_t>(MsgType::USER_LIST_REQ));
+    header.dataLen = qToBigEndian(static_cast<uint32_t>(0)); // 无数据
+    
     // 发送请求
-    m_serverSocket->write((char*)&netHeader, sizeof(PacketHeader));
-    std::cout << "Sent USER_LIST_REQ to server" << std::endl;
+    m_serverSocket->write((char*)&header, sizeof(PacketHeader));
+    std::cout << "发送在线用户列表请求（USER_LIST_REQ）" << std::endl;
 }
 
-// 读取服务端数据（直接用 qFromBigEndian）
+// 显示系统消息（补全实现）
+void ChatWindow::showMessage(const QString& sender, const QString& content) {
+    // 在聊天日志框显示（对应ChatWindow.ui中的textEdit_chatLog）
+    ui->textEdit_chatLog->append(QString("[%1] %2").arg(sender).arg(content));
+}
+
+// 接收服务端数据（修复所有错误）
 void ChatWindow::onServerReadyRead() {
     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
     if (!socket) return;
 
-    // 确保读取完整的协议头（8字节）
-    if (socket->bytesAvailable() < sizeof(PacketHeader)) {
-        return;
-    }
+    // 读取所有数据到粘包缓存
+    m_recvBuffer.append(socket->readAll());
 
-    // 读取协议头并转换为主机字节序（直接调用）
-    PacketHeader netHeader;
-    socket->read((char*)&netHeader, sizeof(PacketHeader));
-    PacketHeader hostHeader;
-    hostHeader.msgType = qFromBigEndian(netHeader.msgType);
-    hostHeader.dataLen = qFromBigEndian(netHeader.dataLen);
+    // 循环解析完整数据包（包头+数据）
+    while (m_recvBuffer.size() >= sizeof(PacketHeader)) {
+        // 提取包头
+        PacketHeader header;
+        memcpy(&header, m_recvBuffer.data(), sizeof(PacketHeader));
+        
+        // 1. 修复ntohl：改用Qt跨平台函数qFromBigEndian
+        // 2. 修复枚举前缀：强转MsgType
+        MsgType msgType = static_cast<MsgType>(qFromBigEndian(header.msgType));
+        uint32_t dataLen = qFromBigEndian(header.dataLen);
 
-    MsgType msgType = static_cast<MsgType>(hostHeader.msgType);
-    uint32_t dataLen = hostHeader.dataLen;
-
-    // 读取JSON数据（如果有）
-    QByteArray jsonData;
-    if (dataLen > 0) {
-        while (socket->bytesAvailable() < dataLen) {
-            socket->waitForReadyRead(100);
+        // 检查数据是否完整
+        if (m_recvBuffer.size() < sizeof(PacketHeader) + dataLen) {
+            break; // 数据不完整，等待后续
         }
-        jsonData = socket->read(dataLen);
-    }
 
-    // 处理不同消息类型
-    switch (msgType) {
-        case MsgType::USER_LIST_RSP: {
-            // 解析用户列表JSON
-            QJsonDocument doc = QJsonDocument::fromJson(jsonData);
-            QJsonObject root = doc.object();
-            QJsonArray usersArr = root["users"].toArray();
+        // 提取JSON数据
+        QByteArray jsonData = m_recvBuffer.mid(sizeof(PacketHeader), dataLen);
+        // 移除已解析的数据包（清理缓存）
+        m_recvBuffer.remove(0, sizeof(PacketHeader) + dataLen);
 
+        // 解析JSON
+        QJsonDocument doc = QJsonDocument::fromJson(jsonData);
+        if (doc.isNull()) {
+            showMessage("系统", "收到无效JSON数据");
+            continue;
+        }
+        QJsonObject root = doc.object();
+
+        // 处理在线用户列表响应（修复枚举前缀）
+        if (msgType == MsgType::USER_LIST_RSP) {
+            QJsonObject data = root["data"].toObject();
+            QJsonArray usersArray = data["users"].toArray();
+
+            // 修复类型不匹配：map转vector（匹配updateOnlineUsers参数）
             std::vector<UserInfo> onlineUsers;
-            for (const auto& userVal : usersArr) {
-                QJsonObject userObj = userVal.toObject();
+            for (const QJsonValue& val : usersArray) {
+                QJsonObject userObj = val.toObject();
                 UserInfo user;
                 user.userId = userObj["userId"].toInt();
                 user.nickname = userObj["nickname"].toString().toStdString();
                 user.ip = userObj["ip"].toString().toStdString();
                 user.dataPort = userObj["dataPort"].toInt();
-                onlineUsers.push_back(user);
+                onlineUsers.push_back(user); // 存入vector
             }
 
-            // 主线程更新UI
-            QMetaObject::invokeMethod(this, [this, onlineUsers]() {
-                updateOnlineUsers(onlineUsers);
-            }, Qt::QueuedConnection);
-            break;
+            // 更新UI（参数为vector，匹配函数声明）
+            updateOnlineUsers(onlineUsers);
+            showMessage("系统", QString("在线用户列表更新：共%1人").arg(onlineUsers.size()));
         }
-
-        default:
-            qWarning() << "Unknown msg type:" << static_cast<uint32_t>(msgType);
-            break;
     }
 }
 
-// 更新在线用户UI
+// 更新在线用户UI（参数为vector<UserInfo>，完全匹配）
 void ChatWindow::updateOnlineUsers(const std::vector<UserInfo>& users) {
     if (!m_onlineUserList) return;
 
-    // 清空列表
+    // 清空旧列表
     m_onlineUserList->clear();
 
-    // 添加在线用户
+    // 添加在线用户到列表
     for (const auto& user : users) {
         QString userText = QString("%1 (ID: %2)")
                             .arg(QString::fromStdString(user.nickname))
                             .arg(user.userId);
         m_onlineUserList->addItem(userText);
     }
-
-    qDebug() << "Updated online users: " << users.size() << " users";
 }
-
-
 // #include "ChatWindow.h"
 // #include <QVBoxLayout>
 // #include <QHBoxLayout>

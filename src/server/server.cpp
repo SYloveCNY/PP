@@ -65,6 +65,38 @@ std::string serializeUserListRsp(const UserListRsp& rsp) {
     return j.dump();
 }
 
+std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users) {
+    json j;
+    j["msgType"] = static_cast<uint32_t>(MsgType::USER_LIST_RSP); // 加MsgType::前缀
+    json data;
+    data["userCount"] = users.size();
+    json usersArray = json::array();
+    for (const auto& [userId, user] : users) {
+        json userObj;
+        userObj["userId"] = user.userId;
+        userObj["nickname"] = user.nickname;
+        userObj["ip"] = user.ip;
+        userObj["dataPort"] = user.dataPort;
+        usersArray.push_back(userObj);
+    }
+    data["users"] = usersArray;
+    j["data"] = data;
+
+    std::string jsonStr = j.dump();
+    return std::vector<char>(jsonStr.begin(), jsonStr.end());
+}
+
+// 服务端处理USER_LIST_REQ的逻辑（替换原二进制发送）
+void handleUserListReq(int clientFd, const std::map<int, UserInfo>& onlineUsers) {
+    std::vector<char> jsonData = serializeUserListJson(onlineUsers);
+    PacketHeader header;
+    // 加MsgType::前缀，转网络字节序
+    header.msgType = htonl(static_cast<uint32_t>(MsgType::USER_LIST_RSP));
+    header.dataLen = htonl(static_cast<uint32_t>(jsonData.size()));
+    send(clientFd, &header, sizeof(header), 0);
+    send(clientFd, jsonData.data(), jsonData.size(), 0);
+}
+
 void handleClient(int clientFd, const std::string& clientIp) {
     std::cout << "New client connected: " << clientIp << std::endl;
 
@@ -164,6 +196,15 @@ void handleClient(int clientFd, const std::string& clientIp) {
     // （优化：可以在登录成功时记录clientFd→userId的映射，断开时根据clientFd删除）
     // 临时方案：这里省略，测试时可重启服务端重置列表
     close(clientFd);
+}
+
+void handleClientMsg(int clientFd, MsgType msgType, const std::vector<char>& data) {
+    // 加MsgType::前缀
+    if (msgType == MsgType::USER_LIST_REQ) {
+        // 修正变量名：g_onlineUsers（服务端全局在线用户map）
+        handleUserListReq(clientFd, g_onlineUsers); 
+    }
+    // 其他消息类型（LOGIN_REQ等）保持不变...
 }
 
 int main() {

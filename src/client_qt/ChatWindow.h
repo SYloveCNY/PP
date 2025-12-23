@@ -3,12 +3,16 @@
 
 #include <QWidget>
 #include <QTcpSocket>
+#include <QByteArray>
 #include <QListWidget>
-#include "protocol_base.h"  // 包含协议头和结构体
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonValue>
+#include <vector>
+#include "protocol_base.h"
 
-namespace Ui {
-class ChatWindow;
-}
+namespace Ui { class ChatWindow; }
 
 class ChatWindow : public QWidget {
     Q_OBJECT
@@ -16,28 +20,26 @@ class ChatWindow : public QWidget {
 public:
     explicit ChatWindow(QWidget *parent = nullptr);
     ~ChatWindow();
-
-    // 设置登录信息（登录成功后调用，传入用户ID、昵称、服务端socket）
     void setLoginInfo(int userId, const QString& nickname, QTcpSocket* serverSocket);
 
 private slots:
-    // 读取服务端数据
     void onServerReadyRead();
-    // 发送用户列表请求
-    void sendUserListReq();
-    // 更新在线用户UI
-    void updateOnlineUsers(const std::vector<UserInfo>& users);
+    void onLoginSuccess();
 
 private:
+    QByteArray m_recvBuffer;
     Ui::ChatWindow *ui;
-    int m_userId;                  // 当前用户ID
-    QString m_nickname;            // 当前用户昵称
-    QTcpSocket* m_serverSocket;    // 与服务端的连接socket
-    QListWidget* m_onlineUserList; // 在线用户列表UI组件（假设UI中已添加）
+    int m_userId;
+    QString m_nickname;
+    QTcpSocket* m_serverSocket;
+    QListWidget* m_onlineUserList;
+
+    void sendUserListReq();
+    void updateOnlineUsers(const std::vector<UserInfo>& users);
+    void showMessage(const QString& sender, const QString& content);
 };
 
-#endif // CHATWINDOW_H
-
+#endif
 
 // #ifndef CHATWINDOW_H
 // #define CHATWINDOW_H
