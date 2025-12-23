@@ -185,82 +185,108 @@ void handleClient(int clientFd) {
     char buf[4096];
     std::vector<char> recvBuffer; // 缓存数据，处理粘包/半包
 
+    std::cout << "[客户端线程启动] 开始处理 fd=" << clientFd << " 的数据" << std::endl;
+
     while (true) {
+        // 1. 接收数据（阻塞模式，直到有数据或连接断开）
         ssize_t n = recv(clientFd, buf, sizeof(buf), 0);
         if (n <= 0) {
-            // 客户端断开连接
+            // 客户端断开连接或接收错误
             std::lock_guard<std::mutex> lock(gMutex);
-            int userId = gFdToUserId[clientFd];
-            std::cout << "客户端断开连接：fd=" << clientFd << "，userId=" << userId << std::endl;
+            int userId = (gFdToUserId.count(clientFd) > 0) ? gFdToUserId[clientFd] : 0;
+            if (n == 0) {
+                std::cout << "[客户端断开] fd=" << clientFd << "，userId=" << userId << "（正常断开）" << std::endl;
+            } else {
+                std::cerr << "[接收错误] fd=" << clientFd << "，错误：" << strerror(errno) << std::endl;
+            }
             
-            // 清理资源
+            // 清理资源（补充：删除 userId→fd 映射，避免残留）
             close(clientFd);
             gFdToUserId.erase(clientFd);
             auto userIt = gOnlineUsers.find(userId);
             if (userIt != gOnlineUsers.end()) {
-                // 广播下线通知
                 std::vector<char> notifyData = serializeUserInfo(userIt->second);
                 broadcastPacket(USER_OFFLINE_NOTIFY, notifyData, -1);
                 gOnlineUsers.erase(userIt);
+                gUserIdToFd.erase(userId); // 补充：清理 userId→fd 映射
+                gUserLastOnlineTime.erase(userId); // 清理心跳记录
             }
             break;
         }
 
-        // 追加数据到缓存
+        // 2. 打印接收详情（关键日志：确认是否收到数据）
+        std::cout << "[接收数据] fd=" << clientFd << "，本次收到 " << n << " 字节，缓冲总大小：" << recvBuffer.size() + n << " 字节" << std::endl;
         recvBuffer.insert(recvBuffer.end(), buf, buf + n);
 
-        // 循环解析完整数据包
+        // 3. 循环解析完整数据包
         while (recvBuffer.size() >= sizeof(PacketHeader)) {
             PacketHeader header;
             memcpy(&header, recvBuffer.data(), sizeof(PacketHeader));
 
-             // ===================== 新增：字节序转换 + 打印验证 =====================
-            uint32_t originalMsgType = header.msgType; // 保存原始网络字节序
+            // 4. 字节序转换（核心步骤，必须执行）
+            uint32_t originalMsgType = header.msgType;
             uint32_t originalDataLen = header.dataLen;
-            header.msgType = ntohl(header.msgType);    // 网络字节序 → 主机字节序
-            header.dataLen = ntohl(header.dataLen);    // 必须转换，否则读取消息体长度错误
-            // =====================================================================
+            header.msgType = ntohl(header.msgType);
+            header.dataLen = ntohl(header.dataLen);
 
-            // 检查数据包是否完整
-            if (recvBuffer.size() < sizeof(PacketHeader) + header.dataLen) {
-                std::cout << "[handleClient解析] fd=" << clientFd << " 数据不完整，等待后续包" << std::endl;
-                break; // 数据不完整，等待后续包
+            // 5. 打印解析详情（关键日志：判断字节序是否正确）
+            std::cout << "[解析包头] fd=" << clientFd
+                      << "，msgType（原始→转换）=" << originalMsgType << "→" << header.msgType
+                      << "，dataLen（原始→转换）=" << originalDataLen << "→" << header.dataLen
+                      << "，缓冲当前大小：" << recvBuffer.size() << " 字节" << std::endl;
+
+            // 6. 关键：判断 dataLen 是否合理（避免异常值导致无限等待）
+            if (header.dataLen > 1024 * 1024) { // 限制最大消息体 1MB，防止恶意数据
+                std::cerr << "[异常警告] fd=" << clientFd << " 收到无效 dataLen=" << header.dataLen << "，断开连接" << std::endl;
+                // 清理资源并退出
+                close(clientFd);
+                gFdToUserId.erase(clientFd);
+                return;
             }
 
-            // 提取payload
+            // 7. 检查数据包是否完整
+            uint32_t totalPacketLen = sizeof(PacketHeader) + header.dataLen;
+            if (recvBuffer.size() < totalPacketLen) {
+                std::cout << "[等待后续包] fd=" << clientFd << "，需要总字节数：" << totalPacketLen 
+                          << "，当前缓冲：" << recvBuffer.size() << " 字节" << std::endl;
+                break;
+            }
+
+            // 8. 提取 payload 并处理
             std::vector<char> payload(
                 recvBuffer.begin() + sizeof(PacketHeader),
-                recvBuffer.begin() + sizeof(PacketHeader) + header.dataLen
+                recvBuffer.begin() + totalPacketLen
             );
 
-            // 移除已处理的数据
-            recvBuffer.erase(recvBuffer.begin(), recvBuffer.begin() + sizeof(PacketHeader) + header.dataLen);
+            // 9. 移除已处理数据
+            recvBuffer.erase(recvBuffer.begin(), recvBuffer.begin() + totalPacketLen);
+            std::cout << "[处理数据包] fd=" << clientFd << "，消息类型：" << header.msgType 
+                      << "，消息体长度：" << payload.size() << " 字节" << std::endl;
 
-            // 处理不同类型的消息
-            // 处理不同类型的消息（使用转换后的 header.msgType！）
+            // 10. 分发消息（原有逻辑不变）
             switch (header.msgType) {
                 case LOGIN_REQ:
-                    std::cout << "[处理消息] fd=" << clientFd << " 登录请求" << std::endl;
+                    std::cout << "[处理消息] fd=" << clientFd << " → 登录请求" << std::endl;
                     handleLoginReq(clientFd, payload);
                     break;
                 case COMMON_MSG:
-                    std::cout << "[处理消息] fd=" << clientFd << " 聊天消息" << std::endl;
+                    std::cout << "[处理消息] fd=" << clientFd << " → 聊天消息" << std::endl;
                     handleCommonMsg(clientFd, payload);
                     break;
                 case USER_LIST_REQ:
-                    std::cout << "[处理消息] fd=" << clientFd << " 用户列表请求" << std::endl;
+                    std::cout << "[处理消息] fd=" << clientFd << " → 用户列表请求" << std::endl;
                     handleUserListReq(clientFd);
                     break;
                 case HEARTBEAT: {
-                    std::cout << "[处理消息] fd=" << clientFd << " 心跳包" << std::endl;
+                    std::cout << "[处理消息] fd=" << clientFd << " → 心跳包" << std::endl;
                     int userId = getUserIdByFd(clientFd);
                     if (userId != -1) {
-                        handleHeartbeat(clientFd, userId); // 更新心跳时间，避免超时
+                        handleHeartbeat(clientFd, userId);
                     }
                     break;
                 }
                 default:
-                    std::cerr << "[处理消息] fd=" << clientFd << " 未知消息类型（转换后）：" << header.msgType << std::endl;
+                    std::cerr << "[未知消息] fd=" << clientFd << "，转换后类型：" << header.msgType << std::endl;
                     break;
             }
         }
