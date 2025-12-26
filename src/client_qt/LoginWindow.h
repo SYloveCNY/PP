@@ -16,6 +16,7 @@ public:
     ~LoginWindow();
 
 private slots:
+    uint16_t getRandomAvailablePort();
     // 声明登录按钮的槽函数（与UI文件中的按钮名称对应）
     void on_pushButton_login_clicked();
 

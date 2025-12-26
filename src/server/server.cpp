@@ -1,12 +1,14 @@
 #include "protocol_base.h"
 #include "json/json.hpp"  // 引入nlohmann/json
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <map>
 #include <iostream>
-#include <thread>
+//#include <thread>
 
 using json = nlohmann::json;  // 简化命名空间
 
@@ -97,28 +99,33 @@ void handleUserListReq(int clientFd, const std::map<int, UserInfo>& onlineUsers)
     send(clientFd, jsonData.data(), jsonData.size(), 0);
 }
 
-void handleClient(int clientFd, const std::string& clientIp) {
+bool handleClient(int clientFd, const std::string& clientIp) {
     std::cout << "New client connected: " << clientIp << std::endl;
 
-    while (true) {
+//    while (true) {
         // 步骤1：读取协议头（8字节）
         PacketHeader netHeader;
         ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader), 0);
         if (headerLen <= 0) {
             std::cout << "Client disconnected: " << clientIp << std::endl;
-            break;
+            return false;
         }
         PacketHeader hostHeader = ntohHeader(netHeader);
         MsgType msgType = static_cast<MsgType>(hostHeader.msgType);
         uint32_t dataLen = hostHeader.dataLen;
+		std::cout << "msgType = " << (int)msgType << ", dataLen = " << dataLen << std::endl;
 
-        // 步骤2：读取JSON数据
-        std::string jsonData(dataLen, '\0');
-        ssize_t dataLenRecv = recv(clientFd, jsonData.data(), dataLen, 0);
-        if (dataLenRecv != dataLen) {
-            std::cerr << "Failed to read full data from client" << std::endl;
-            break;
-        }
+		std::string jsonData(dataLen, '\0');
+		if (dataLen)
+		{
+			// 步骤2：读取JSON数据
+			ssize_t dataLenRecv = recv(clientFd, jsonData.data(), dataLen, 0);
+			std::cout << "dataLenRecv = " << dataLenRecv << ", dataLen = " << dataLen << std::endl;
+			if (dataLenRecv != dataLen) {
+				std::cerr << "Failed to read full data from client" << std::endl;
+				return false;//break;
+			}
+		}
 
         // 步骤3：根据消息类型处理
         switch (msgType) {
@@ -182,6 +189,7 @@ void handleClient(int clientFd, const std::string& clientIp) {
 
                 send(clientFd, &netRspHeader, sizeof(PacketHeader), 0);
                 send(clientFd, rspJson.data(), rspJson.size(), 0);
+				std::cout << "rspJson = " << rspJson << std::endl;
                 std::cout << "Sent user list to client: " << clientIp << " (count: " << rsp.users.size() << ")" << std::endl;
                 break;
             }
@@ -190,12 +198,13 @@ void handleClient(int clientFd, const std::string& clientIp) {
                 std::cerr << "Unknown msg type: " << static_cast<uint32_t>(msgType) << std::endl;
                 break;
         }
-    }
+    //}
 
+	return true;
     // 客户端断开连接：从在线列表移除（这里简化，实际需要存储clientFd和userId的映射）
     // （优化：可以在登录成功时记录clientFd→userId的映射，断开时根据clientFd删除）
     // 临时方案：这里省略，测试时可重启服务端重置列表
-    close(clientFd);
+ //   close(clientFd);
 }
 
 void handleClientMsg(int clientFd, MsgType msgType, const std::vector<char>& data) {
@@ -207,6 +216,26 @@ void handleClientMsg(int clientFd, MsgType msgType, const std::vector<char>& dat
     // 其他消息类型（LOGIN_REQ等）保持不变...
 }
 
+int make_socket_non_blocking(int sfd) {
+    int flags, s;
+
+    flags = fcntl(sfd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl");
+        return -1;
+    }
+
+    flags |= SOCK_NONBLOCK;
+    s = fcntl(sfd, F_SETFL, flags);
+    if (s == -1) {
+        perror("fcntl");
+        return -1;
+    }
+    return 0;
+}
+
+constexpr int MAX_EVENTS = 10;
+
 int main() {
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) {
@@ -214,9 +243,11 @@ int main() {
         return -1;
     }
 
+	std::map<int, sockaddr_in> client_infos;
     // 端口复用
     int opt = 1;
     setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+//	make_socket_non_blocking(serverFd);
 
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
@@ -237,18 +268,35 @@ int main() {
 
     std::cout << "Server started on port 8888" << std::endl;
 
-    while (true) {
-        sockaddr_in clientAddr;
-        socklen_t clientAddrLen = sizeof(clientAddr);
-        int clientFd = accept(serverFd, (sockaddr*)&clientAddr, &clientAddrLen);
-        if (clientFd < 0) {
-            std::cerr << "Failed to accept client" << std::endl;
-            continue;
-        }
+    // 创建epoll实例
+    int epoll_fd = epoll_create1(0);
+	epoll_event ev, events[MAX_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd = serverFd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, serverFd, &ev);
 
-        // 多线程处理客户端（简单方案，实际可优化为线程池）
-        std::thread clientThread(handleClient, clientFd, inet_ntoa(clientAddr.sin_addr));
-        clientThread.detach();
+    while (true) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == serverFd) {
+                // 新连接
+				sockaddr_in clientAddr;
+				socklen_t clientAddrLen = sizeof(clientAddr);
+				int clientFd = accept(serverFd, (sockaddr*)&clientAddr, &clientAddrLen);
+                ev.events = EPOLLIN | EPOLLET;
+                ev.data.fd = clientFd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, clientFd, &ev);
+				client_infos.emplace(clientFd, clientAddr);
+            } else {
+				int clientFd = events[i].data.fd;
+				auto it = client_infos.find(clientFd);
+				if (!handleClient(clientFd, inet_ntoa(it->second.sin_addr)))
+				{
+					close(clientFd);
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clientFd, NULL);
+				}
+			}
+		}
     }
 
     close(serverFd);

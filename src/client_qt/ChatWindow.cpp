@@ -56,8 +56,6 @@ void ChatWindow::showMessage(const QString& sender, const QString& content) {
     // 在聊天日志框显示（对应ChatWindow.ui中的textEdit_chatLog）
     ui->textEdit_chatLog->append(QString("[%1] %2").arg(sender).arg(content));
 }
-
-// 接收服务端数据（修复所有错误）
 void ChatWindow::onServerReadyRead() {
     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
     if (!socket) return;
@@ -74,49 +72,175 @@ void ChatWindow::onServerReadyRead() {
         // 1. 修复ntohl：改用Qt跨平台函数qFromBigEndian
         // 2. 修复枚举前缀：强转MsgType
         MsgType msgType = static_cast<MsgType>(qFromBigEndian(header.msgType));
-        uint32_t dataLen = qFromBigEndian(header.dataLen);
+        uint32_t recvDataLen = qFromBigEndian(header.dataLen); // 重命名避免冲突
 
-        // 检查数据是否完整
-        if (m_recvBuffer.size() < sizeof(PacketHeader) + dataLen) {
+        // 检查数据是否完整（兼容服务器dataLen=0的临时方案）
+        uint32_t totalPacketLen = sizeof(PacketHeader) + recvDataLen;
+        // 临时适配：如果是用户列表请求且dataLen=0，强制按实际缓存长度提取数据
+        bool isUserListReq = (msgType == MsgType::USER_LIST_REQ);
+        if (isUserListReq && recvDataLen == 0) {
+            totalPacketLen = m_recvBuffer.size(); // 取缓存中所有数据
+        }
+        
+        if (m_recvBuffer.size() < totalPacketLen) {
             break; // 数据不完整，等待后续
         }
 
-        // 提取JSON数据
-        QByteArray jsonData = m_recvBuffer.mid(sizeof(PacketHeader), dataLen);
+        // 提取JSON数据（适配服务器dataLen=0的问题）
+        QByteArray jsonData;
+        if (isUserListReq && recvDataLen == 0) {
+            // 服务器标dataLen=0但实际有数据，提取包头后的所有数据
+            jsonData = m_recvBuffer.mid(sizeof(PacketHeader));
+        } else {
+            jsonData = m_recvBuffer.mid(sizeof(PacketHeader), recvDataLen);
+        }
+
         // 移除已解析的数据包（清理缓存）
-        m_recvBuffer.remove(0, sizeof(PacketHeader) + dataLen);
+        m_recvBuffer.remove(0, totalPacketLen);
 
         // 解析JSON
         QJsonDocument doc = QJsonDocument::fromJson(jsonData);
         if (doc.isNull()) {
-            showMessage("系统", "收到无效JSON数据");
+            showMessage("系统", "收到无效JSON数据");  
             continue;
         }
         QJsonObject root = doc.object();
+        showMessage("", QJsonDocument(root).toJson(QJsonDocument::Indented)); 
 
-        // 处理在线用户列表响应（修复枚举前缀）
-        if (msgType == MsgType::USER_LIST_RSP) {
-            QJsonObject data = root["data"].toObject();
-            QJsonArray usersArray = data["users"].toArray();
+        // ========== 关键修改1：适配服务器错误的msgType（USER_LIST_REQ=3） ==========
+        if (msgType == MsgType::USER_LIST_REQ) {
+            // ========== 关键修改2：修正JSON解析路径（去掉多余的data层） ==========
+            QJsonArray usersArray = root["users"].toArray();
+
+            // 容错：如果users数组为空，提示并返回
+            if (usersArray.isEmpty()) {
+                showMessage("系统", "当前无在线用户");
+                continue; // 用continue而非return，避免中断后续数据包解析
+            }
 
             // 修复类型不匹配：map转vector（匹配updateOnlineUsers参数）
             std::vector<UserInfo> onlineUsers;
             for (const QJsonValue& val : usersArray) {
+                // 容错：确保val是JSON对象
+                if (!val.isObject()) continue;
+
                 QJsonObject userObj = val.toObject();
                 UserInfo user;
-                user.userId = userObj["userId"].toInt();
-                user.nickname = userObj["nickname"].toString().toStdString();
-                user.ip = userObj["ip"].toString().toStdString();
-                user.dataPort = userObj["dataPort"].toInt();
-                onlineUsers.push_back(user); // 存入vector
+                // 容错：字段不存在时赋默认值
+                user.userId = userObj.contains("userId") ? userObj["userId"].toInt() : 0;
+                user.nickname = userObj.contains("nickname") ? userObj["nickname"].toString().toStdString() : "";
+                user.ip = userObj.contains("ip") ? userObj["ip"].toString().toStdString() : "";
+                user.dataPort = userObj.contains("dataPort") ? userObj["dataPort"].toInt() : 0;
+
+                // ========== 关键修改3：修复重复添加用户的问题 ==========
+                if (user.userId != 0) {  // 过滤无效用户
+                    onlineUsers.push_back(user);
+                }
             }
 
             // 更新UI（参数为vector，匹配函数声明）
             updateOnlineUsers(onlineUsers);
             showMessage("系统", QString("在线用户列表更新：共%1人").arg(onlineUsers.size()));
         }
+        // 保留原USER_LIST_RSP判断（服务器修复后可直接用）
+        else if (msgType == MsgType::USER_LIST_RSP) {
+            QJsonArray usersArray = root["users"].toArray();
+            if (usersArray.isEmpty()) {
+                showMessage("系统", "当前无在线用户");
+                continue;
+            }
+            std::vector<UserInfo> onlineUsers;
+            for (const QJsonValue& val : usersArray) {
+                if (!val.isObject()) continue;
+                QJsonObject userObj = val.toObject();
+                UserInfo user;
+                user.userId = userObj.contains("userId") ? userObj["userId"].toInt() : 0;
+                user.nickname = userObj.contains("nickname") ? userObj["nickname"].toString().toStdString() : "";
+                user.ip = userObj.contains("ip") ? userObj["ip"].toString().toStdString() : "";
+                user.dataPort = userObj.contains("dataPort") ? userObj["dataPort"].toInt() : 0;
+                if (user.userId != 0) {
+                    onlineUsers.push_back(user);
+                }
+            }
+            updateOnlineUsers(onlineUsers);
+            showMessage("系统", QString("在线用户列表更新：共%1人").arg(onlineUsers.size()));
+        }
     }
 }
+
+// // 接收服务端数据（修复所有错误）
+// void ChatWindow::onServerReadyRead() {
+//     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
+//     if (!socket) return;
+
+//     // 读取所有数据到粘包缓存
+//     m_recvBuffer.append(socket->readAll());
+
+//     // 循环解析完整数据包（包头+数据）
+//     while (m_recvBuffer.size() >= sizeof(PacketHeader)) {
+//         // 提取包头
+//         PacketHeader header;
+//         memcpy(&header, m_recvBuffer.data(), sizeof(PacketHeader));
+        
+//         // 1. 修复ntohl：改用Qt跨平台函数qFromBigEndian
+//         // 2. 修复枚举前缀：强转MsgType
+//         MsgType msgType = static_cast<MsgType>(qFromBigEndian(header.msgType));
+//         uint32_t dataLen = qFromBigEndian(header.dataLen);
+
+//         // 检查数据是否完整
+//         if (m_recvBuffer.size() < sizeof(PacketHeader) + dataLen) {
+//             break; // 数据不完整，等待后续
+//         }
+
+//         // 提取JSON数据
+//         QByteArray jsonData = m_recvBuffer.mid(sizeof(PacketHeader), dataLen);
+//         // 移除已解析的数据包（清理缓存）
+//         m_recvBuffer.remove(0, sizeof(PacketHeader) + dataLen);
+
+//         // 解析JSON
+//         QJsonDocument doc = QJsonDocument::fromJson(jsonData);
+//         if (doc.isNull()) {
+//             showMessage("系统", "收到无效JSON数据");  
+//             continue;
+//         }
+//         QJsonObject root = doc.object();
+// 		showMessage("", QJsonDocument(root).toJson(QJsonDocument::Indented)); // Indented表示带缩进的格式化输出//qDebug() << root << '\n';
+//         // 处理在线用户列表响应（修复枚举前缀）
+//         if (msgType == MsgType::USER_LIST_RSP) {
+//             QJsonObject data = root["data"].toObject();
+//             QJsonArray usersArray = data["users"].toArray();
+
+//             // 容错：如果users数组为空，提示并返回
+//             if (usersArray.isEmpty()) {
+//                 showMessage("系统", "当前无在线用户");
+//                 return;
+//             }
+
+//             // 修复类型不匹配：map转vector（匹配updateOnlineUsers参数）
+//             std::vector<UserInfo> onlineUsers;
+//             for (const QJsonValue& val : usersArray) {
+//                 // 容错：确保val是JSON对象
+//                 if (!val.isObject()) continue;
+
+//                 QJsonObject userObj = val.toObject();
+//                 UserInfo user;
+//                 user.userId = userObj["userId"].toInt();
+//                 user.nickname = userObj["nickname"].toString().toStdString();
+//                 user.ip = userObj["ip"].toString().toStdString();
+//                 user.dataPort = userObj["dataPort"].toInt();
+//                 onlineUsers.push_back(user); // 存入vector
+
+//                 if (user.userId != 0) {  // 过滤无效用户
+//                     onlineUsers.push_back(user);
+//                 }
+//             }
+
+//             // 更新UI（参数为vector，匹配函数声明）
+//             updateOnlineUsers(onlineUsers);
+//             showMessage("系统", QString("在线用户列表更新：共%1人").arg(onlineUsers.size()));
+//         }
+//     }
+// }
 
 // 更新在线用户UI（参数为vector<UserInfo>，完全匹配）
 void ChatWindow::updateOnlineUsers(const std::vector<UserInfo>& users) {
@@ -133,6 +257,7 @@ void ChatWindow::updateOnlineUsers(const std::vector<UserInfo>& users) {
         m_onlineUserList->addItem(userText);
     }
 }
+
 // #include "ChatWindow.h"
 // #include <QVBoxLayout>
 // #include <QHBoxLayout>
