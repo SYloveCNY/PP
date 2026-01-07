@@ -3,102 +3,56 @@
 
 #include <QWidget>
 #include <QTcpSocket>
-#include <QByteArray>
-#include <QListWidget>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QJsonValue>
-#include <vector>
-#include "protocol_base.h"
+#include <QString>
+#include <QTimer>
+#include "../../include/protocol.h"
 
-namespace Ui { class ChatWindow; }
+class QLabel;
+class QTextEdit;
+class QLineEdit;
 
 class ChatWindow : public QWidget {
     Q_OBJECT
 
 public:
     explicit ChatWindow(QWidget *parent = nullptr);
-    ~ChatWindow();
-    void setLoginInfo(int userId, const QString& nickname, QTcpSocket* serverSocket);
+    ~ChatWindow() override;
+
+    // 设置登录信息
+    void setLoginInfo(int userId, const QString& nickname, QTcpSocket* socket);
 
 private slots:
+    // 发送心跳包
+    void sendHeartbeat();
+    // 处理服务器数据
     void onServerReadyRead();
-    void onLoginSuccess();
+    // 发送普通消息
+    void sendMessage();
+    // 打开图片选择对话框
+    void sendImageDialog();
 
 private:
-    QByteArray m_recvBuffer;
-    Ui::ChatWindow *ui;
-    int m_userId;
-    QString m_nickname;
-    QTcpSocket* m_serverSocket;
-    QListWidget* m_onlineUserList;
-
-    void sendUserListReq();
-    void updateOnlineUsers(const std::vector<UserInfo>& users);
+    // 初始化UI
+    void initUI();
+    // 更新用户列表
+    void updateUserList(const std::vector<UserInfo>& users);
+    // 处理上线/下线通知
+    void processNotification(const MsgType& type, const std::string& data);
+    // 发送图片
+    void sendImage(const QString& filePath);
+    // 显示聊天消息（仅一个实现）
     void showMessage(const QString& sender, const QString& content);
+
+    // 成员变量
+    int m_userId = 0;
+    QString m_nickname;
+    QTcpSocket* m_socket = nullptr;
+    QTimer* m_heartbeatTimer = nullptr; // 心跳定时器
+
+    // UI控件
+    QLabel* m_userInfoLabel = nullptr;
+    QTextEdit* m_chatRecordEdit = nullptr;
+    QLineEdit* m_inputEdit = nullptr;
 };
 
-#endif
-
-// #ifndef CHATWINDOW_H
-// #define CHATWINDOW_H
-
-// #include <QWidget>
-// #include <QTcpSocket>
-// #include <QUdpSocket>
-// #include <QByteArray>
-// #include <QTimer>
-// #include <map>
-// #include "UserInfo.h"  // 包含 UserInfo 结构体
-// #include "protocol_qt.h"  // 包含 MsgType、PacketHeader 等枚举/结构体
-
-// class QListWidget;
-// class QTextEdit;
-// class QLineEdit;
-// class QPushButton;
-
-// class ChatWindow : public QWidget
-// {
-//     Q_OBJECT
-
-// public:
-//     explicit ChatWindow(int userId, const QString& nickname, QTcpSocket* serverSocket, QUdpSocket* udpSocket = nullptr, QWidget* parent = nullptr);
-//     ~ChatWindow();
-
-// private slots:
-//     void onServerReadyRead();       // 接收服务端数据
-//     void onDisconnected();          // 处理断开连接
-//     void sendHeartbeat();           // 发送心跳包
-//     void sendMessage(const QString& content);  // 发送聊天消息
-
-// private:
-//     void initUI();                  // 初始化UI
-//     void initTimers();              // 初始化定时器
-//     void bindSocketSignals();       // 绑定Socket信号槽
-//     void sendUserListReq();         // 发送用户列表请求
-//     void updateOnlineUsers(const std::map<int, UserInfo>& onlineUsers);  // 更新用户列表UI
-//     void showMessage(const QString& sender, const QString& content);     // 显示聊天消息
-//     void handleMessage(MsgType msgType, const std::vector<char>& payload);  // 处理不同类型消息
-
-// private:
-//     int m_userId;                   // 当前登录用户ID
-//     QString m_nickname;             // 当前登录用户昵称
-//     QTcpSocket* m_serverSocket;     // TCP连接Socket（与服务端）
-//     QUdpSocket* m_udpSocket;        // UDP Socket（点对点通信，可选）
-//     QByteArray m_recvBuffer;        // 接收数据缓存（处理粘包/半包）
-//     std::map<int, UserInfo> m_onlineUsers;  // 在线用户列表（key=userId）
-//     int m_selectedUserId;           // 选中的目标用户ID（0=广播）
-
-//     // UI控件
-//     QListWidget* m_userListWidget;  // 在线用户列表控件
-//     QTextEdit* m_chatDisplay;       // 聊天显示区域
-//     QLineEdit* m_msgInput;          // 消息输入框
-//     QPushButton* m_sendBtn;         // 发送按钮
-
-//     // 定时器
-//     QTimer* m_heartbeatTimer;       // 心跳定时器
-//     QTimer* m_userListTimeoutTimer; // 用户列表请求超时定时器
-// };
-
-// #endif // CHATWINDOW_H
+#endif // CHATWINDOW_H

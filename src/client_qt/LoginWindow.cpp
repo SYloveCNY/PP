@@ -1,7 +1,7 @@
 #include "LoginWindow.h"
 #include "ui_LoginWindow.h"
 #include "ChatWindow.h"
-#include "protocol_base.h"
+#include "protocol.h"
 #include "protocol_qt.h"
 #include <QJsonDocument>
 #include <QJsonObject>

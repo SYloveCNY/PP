@@ -1,359 +1,199 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
-// 新增：必须的基础头文件
-#include <iostream>   // std::cerr
-#include <ostream>    // std::endl
-#include <vector>
-#include <string>
-#include <map>
-#include <stdexcept>
+// 系统头文件（网络字节序转换+跨平台兼容）
+#if defined(__linux__) || defined(__APPLE__)
+#include <arpa/inet.h>
+#elif defined(_WIN32) || defined(_WIN64)
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 #include <cstdint>
-#include <arpa/inet.h> // 字节序转换（可选，跨平台用）
-#include <QTcpSocket>  // 客户端sendPacket需要QT Socket头文件
+#include <string>
+#include <vector>
+#include <map>
+#include "./json/json.hpp"
 
-// 定义MsgType（建议用uint32_t避免枚举字节大小问题）
-enum class MsgType : uint32_t {
-    LOGIN_REQ = 1,        // 登录请求
-    LOGIN_RSP = 2,        // 登录响应
-    USER_LIST_REQ = 3,    // 用户列表请求
-    USER_LIST_RSP = 4,    // 用户列表响应（必须添加！）
-    COMMON_MSG = 5,       // 普通消息
-    USER_ONLINE_NOTIFY = 6,// 用户上线通知
-    USER_OFFLINE_NOTIFY =7,// 用户下线通知
-    HEARTBEAT = 10        // 心跳包
-};
-
-// 数据包头部
+// ========== 补全PacketHeader结构体（添加msgId和senderId） ==========
 struct PacketHeader {
-    MsgType msgType;
-    uint32_t dataLen;
+    uint32_t msgType;    // 消息类型（对应MsgType枚举）
+    uint32_t dataLen;    // 数据部分长度
+    uint32_t msgId;      // 消息ID（缺失的成员）
+    uint32_t senderId;   // 发送者ID（缺失的成员）
 };
 
-// LoginReq结构体
-struct LoginReq {
-    std::string nickname;
-    std::vector<char> avatar;
-    uint16_t dataPort;
+// 消息类型枚举（包含所有用到的类型）
+enum class MsgType : uint32_t {
+    LOGIN_REQ = 1,          
+    LOGIN_RSP = 2,          
+    USER_LIST_REQ = 3,      
+    USER_LIST_RSP = 4,      
+    COMMON_MSG = 5,         
+    USER_STATUS_NOTIFY = 6, 
+    HEARTBEAT = 7,          
+    USER_ONLINE_NOTIFY = 8, 
+    USER_OFFLINE_NOTIFY = 9,
+    IMAGE_MSG = 11,         
+    FILE_MSG = 12           
 };
 
-// LoginRsp结构体
-struct LoginRsp {
-    bool success;
-    int userId;
-    std::string msg;
-    std::string nickname;
-};
-
-// UserInfo结构体
+// 用户信息结构体（包含ip和dataPort）
 struct UserInfo {
-    int userId;
-    std::string nickname;
-    std::vector<char> avatar;
-    uint16_t dataPort;
-    std::string ip;
-    int managePort; // 服务端管理连接的端口
+    int userId;             
+    std::string nickname;   
+    bool isOnline;          
+    std::string ip;         
+    int dataPort = 0;       
 };
 
-// CommonMsg结构体（客户端聊天消息）
-struct CommonMsg {
-    int fromUserId;
-    std::string fromNickname;
-    std::string content;
-    int toUserId; // 0表示广播
+// 登录请求/响应
+struct LoginReq {
+    std::string nickname;   
 };
 
-// ========== 补全缺失的核心函数：serializeVector/deserializeVector ==========
-// 检查长度合法性（防止超大值）
-inline bool isValidLength(uint32_t len, size_t maxAllowed = 1024 * 1024) {
-    return len <= maxAllowed && len != 0xFFFFFFFF;
+struct LoginRsp {
+    bool success;           
+    std::string msg;        
+    int userId;             
+};
+
+// 用户列表响应
+struct UserListRsp {
+    std::vector<UserInfo> users; 
+};
+
+// 用户状态通知
+struct UserStatusNotify {
+    int userId;             
+    std::string nickname;   
+    bool isOnline;          
+};
+
+// 图片消息（包含fileName/fileSize/base64Data）
+struct ImageMsg {
+    int senderId;           
+    int receiverId;         
+    std::string imagePath;  
+    std::string imageData;  
+    std::string fileName;   
+    std::string fileSize;   
+    std::string base64Data; 
+};
+
+// 文件消息结构体
+struct FileMsg {
+    int receiverId;          // 接收者ID，0表示群发
+    std::string fileName;    // 文件名
+    std::string fileSize;    // 文件大小
+    std::string fileHash;    // 文件哈希值
+    bool isComplete;         // 是否为完整文件
+    std::string base64Data;  // Base64编码的文件数据片段
+};
+
+// JSON序列化特化（所有结构体）
+namespace nlohmann {
+template <> struct adl_serializer<UserInfo> {
+    static void to_json(json& j, const UserInfo& u) {
+        j = json{{"userId", u.userId}, {"nickname", u.nickname}, {"isOnline", u.isOnline},
+                 {"ip", u.ip}, {"dataPort", u.dataPort}};
+    }
+    static void from_json(const json& j, UserInfo& u) {
+        j.at("userId").get_to(u.userId);
+        j.at("nickname").get_to(u.nickname);
+        j.at("isOnline").get_to(u.isOnline);
+        u.ip = j.contains("ip") ? j["ip"].get<std::string>() : "";
+        u.dataPort = j.contains("dataPort") ? j["dataPort"].get<int>() : 0;
+    }
+};
+
+template <> struct adl_serializer<LoginReq> {
+    static void to_json(json& j, const LoginReq& req) { j = json{{"nickname", req.nickname}}; }
+    static void from_json(const json& j, LoginReq& req) { j.at("nickname").get_to(req.nickname); }
+};
+
+template <> struct adl_serializer<LoginRsp> {
+    static void to_json(json& j, const LoginRsp& rsp) {
+        j = json{{"success", rsp.success}, {"msg", rsp.msg}, {"userId", rsp.userId}};
+    }
+    static void from_json(const json& j, LoginRsp& rsp) {
+        j.at("success").get_to(rsp.success);
+        j.at("msg").get_to(rsp.msg);
+        j.at("userId").get_to(rsp.userId);
+    }
+};
+
+template <> struct adl_serializer<UserListRsp> {
+    static void to_json(json& j, const UserListRsp& rsp) { j = json{{"users", rsp.users}}; }
+    static void from_json(const json& j, UserListRsp& rsp) { j.at("users").get_to(rsp.users); }
+};
+
+template <> struct adl_serializer<UserStatusNotify> {
+    static void to_json(json& j, const UserStatusNotify& notify) {
+        j = json{{"userId", notify.userId}, {"nickname", notify.nickname}, {"isOnline", notify.isOnline}};
+    }
+    static void from_json(const json& j, UserStatusNotify& notify) {
+        j.at("userId").get_to(notify.userId);
+        j.at("nickname").get_to(notify.nickname);
+        j.at("isOnline").get_to(notify.isOnline);
+    }
+};
+
+template <> struct adl_serializer<ImageMsg> {
+    static void to_json(json& j, const ImageMsg& msg) {
+        j = json{{"senderId", msg.senderId}, {"receiverId", msg.receiverId}, {"imagePath", msg.imagePath},
+                 {"imageData", msg.imageData}, {"fileName", msg.fileName}, {"fileSize", msg.fileSize},
+                 {"base64Data", msg.base64Data}};
+    }
+    static void from_json(const json& j, ImageMsg& msg) {
+        j.at("senderId").get_to(msg.senderId);
+        j.at("receiverId").get_to(msg.receiverId);
+        j.at("imagePath").get_to(msg.imagePath);
+        j.at("imageData").get_to(msg.imageData);
+        msg.fileName = j.contains("fileName") ? j["fileName"].get<std::string>() : "";
+        msg.fileSize = j.contains("fileSize") ? j["fileSize"].get<std::string>() : "";
+        msg.base64Data = j.contains("base64Data") ? j["base64Data"].get<std::string>() : "";
+    }
+};
+} // namespace nlohmann
+
+// 序列化/反序列化工具函数
+template <typename T>
+std::string serialize(const T& obj) {
+    nlohmann::json j = obj;
+    return j.dump();
 }
 
-// 字符串序列化（基础函数：修复const_cast问题）
-inline std::vector<char> serializeString(const std::string& str) {
-    std::vector<char> data;
-    uint32_t len = static_cast<uint32_t>(str.size());
-    len = htonl(len); // 转网络字节序（跨平台必加）
-    // 修复：reinterpret_cast<const char*> 匹配const参数
-    data.insert(data.end(), reinterpret_cast<const char*>(&len), 
-                reinterpret_cast<const char*>(&len) + sizeof(uint32_t));
-    if (len > 0) {
-        data.insert(data.end(), str.begin(), str.end());
-    }
-    return data;
+template <typename T>
+T deserialize(const std::string& jsonStr) {
+    nlohmann::json j = nlohmann::json::parse(jsonStr);
+    return j.get<T>();
 }
 
-// 字符串反序列化（基础函数）
-inline std::string deserializeString(const std::vector<char>& data, size_t& offset) {
-    if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("String length field out of bounds");
-    }
-    uint32_t len = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    len = ntohl(len); // 转主机字节序
-    offset += sizeof(uint32_t);
-    
-    if (!isValidLength(len) || (offset + len) > data.size()) {
-        throw std::length_error("Invalid string length: " + std::to_string(len));
-    }
-    
-    std::string str;
-    if (len > 0) {
-        str.assign(data.data() + offset, data.data() + offset + len);
-    }
-    offset += len;
-    return str;
+// 网络字节序转换函数（包含msgId和senderId）
+inline PacketHeader htonHeader(const PacketHeader& header) {
+    PacketHeader netHeader = header;
+    netHeader.msgType = htonl(header.msgType);
+    netHeader.dataLen = htonl(header.dataLen);
+    netHeader.msgId = htonl(header.msgId);    // 新增：转换msgId
+    netHeader.senderId = htonl(header.senderId); // 新增：转换senderId
+    return netHeader;
 }
 
-// 二进制vector（头像）序列化（修复const_cast问题）
-inline std::vector<char> serializeVector(const std::vector<char>& vec) {
-    std::vector<char> data;
-    uint32_t len = static_cast<uint32_t>(vec.size());
-    len = htonl(len); // 转网络字节序
-    // 修复：reinterpret_cast<const char*>
-    data.insert(data.end(), reinterpret_cast<const char*>(&len), 
-                reinterpret_cast<const char*>(&len) + sizeof(uint32_t));
-    if (len > 0) {
-        data.insert(data.end(), vec.begin(), vec.end());
-    }
-    return data;
+inline PacketHeader ntohHeader(const PacketHeader& netHeader) {
+    PacketHeader hostHeader = netHeader;
+    hostHeader.msgType = ntohl(netHeader.msgType);
+    hostHeader.dataLen = ntohl(netHeader.dataLen);
+    hostHeader.msgId = ntohl(netHeader.msgId);    // 新增：转换msgId
+    hostHeader.senderId = ntohl(netHeader.senderId); // 新增：转换senderId
+    return hostHeader;
 }
 
-// 二进制vector（头像）反序列化
-inline std::vector<char> deserializeVector(const std::vector<char>& data, size_t& offset) {
-    if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("Vector length field out of bounds");
-    }
-    uint32_t len = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    len = ntohl(len); // 转主机字节序
-    offset += sizeof(uint32_t);
-    
-    if (!isValidLength(len) || (offset + len) > data.size()) {
-        throw std::length_error("Invalid vector length: " + std::to_string(len));
-    }
-    
-    std::vector<char> vec;
-    if (len > 0) {
-        vec.assign(data.data() + offset, data.data() + offset + len);
-    }
-    offset += len;
-    return vec;
-}
-
-// ========== LoginReq序列化/反序列化 ==========
-inline std::vector<char> serializeLoginReq(const LoginReq& req) {
-    std::vector<char> data;
-    // 序列化昵称
-    auto nicknameData = serializeString(req.nickname);
-    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    // 序列化头像
-    auto avatarData = serializeVector(req.avatar);
-    data.insert(data.end(), avatarData.begin(), avatarData.end());
-    // 序列化dataPort（转网络字节序 + 修复const_cast）
-    uint16_t port = htons(req.dataPort);
-    data.insert(data.end(), reinterpret_cast<const char*>(&port), 
-                reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
-    return data;
-}
-
-inline LoginReq deserializeLoginReq(const std::vector<char>& data) {
-    LoginReq req;
-    size_t offset = 0;
-    try {
-        req.nickname = deserializeString(data, offset);
-        req.avatar = deserializeVector(data, offset);
-        
-        if (offset + sizeof(uint16_t) > data.size()) {
-            throw std::out_of_range("DataPort field out of bounds");
-        }
-        uint16_t port = *reinterpret_cast<const uint16_t*>(data.data() + offset);
-        req.dataPort = ntohs(port); // 转主机字节序
-        offset += sizeof(uint16_t);
-    } catch (const std::exception& e) {
-        std::cerr << "Deserialize LoginReq failed: " << e.what() << std::endl;
-        req = LoginReq{}; // 重置为空
-    }
-    return req;
-}
-
-// ========== LoginRsp序列化/反序列化 ==========
-inline LoginRsp deserializeLoginRsp(const std::vector<char>& data) {
-    LoginRsp rsp;
-    size_t offset = 0;
-    try {
-        // 解析success
-        if (offset + sizeof(bool) > data.size()) {
-            throw std::out_of_range("Success field out of bounds");
-        }
-        rsp.success = *reinterpret_cast<const bool*>(data.data() + offset);
-        offset += sizeof(bool);
-        // 解析userId
-        if (offset + sizeof(int) > data.size()) {
-            throw std::out_of_range("UserID field out of bounds");
-        }
-        rsp.userId = *reinterpret_cast<const int*>(data.data() + offset);
-        offset += sizeof(int);
-        // 解析msg和nickname
-        rsp.msg = deserializeString(data, offset);
-        rsp.nickname = deserializeString(data, offset);
-    } catch (const std::exception& e) {
-        std::cerr << "Deserialize LoginRsp failed: " << e.what() << std::endl;
-        rsp = LoginRsp{};
-    }
-    return rsp;
-}
-
-inline std::vector<char> serializeLoginRsp(const LoginRsp& rsp) {
-    std::vector<char> data;
-    // 修复const_cast问题：全部用const char*
-    data.insert(data.end(), reinterpret_cast<const char*>(&rsp.success),
-                reinterpret_cast<const char*>(&rsp.success) + sizeof(bool));
-    data.insert(data.end(), reinterpret_cast<const char*>(&rsp.userId),
-                reinterpret_cast<const char*>(&rsp.userId) + sizeof(int));
-    // 序列化msg和nickname
-    auto msgData = serializeString(rsp.msg);
-    data.insert(data.end(), msgData.begin(), msgData.end());
-    auto nicknameData = serializeString(rsp.nickname);
-    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    return data;
-}
-
-// ========== UserInfo序列化/反序列化 ==========
-inline std::vector<char> serializeUserInfo(const UserInfo& user) {
-    std::vector<char> data;
-    // 修复const_cast问题
-    data.insert(data.end(), reinterpret_cast<const char*>(&user.userId),
-                reinterpret_cast<const char*>(&user.userId) + sizeof(int));
-    // 序列化昵称
-    auto nicknameData = serializeString(user.nickname);
-    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    // 序列化头像
-    auto avatarData = serializeVector(user.avatar);
-    data.insert(data.end(), avatarData.begin(), avatarData.end());
-    // 序列化dataPort（转网络字节序）
-    uint16_t port = htons(user.dataPort);
-    data.insert(data.end(), reinterpret_cast<const char*>(&port),
-                reinterpret_cast<const char*>(&port) + sizeof(uint16_t));
-    // 序列化IP
-    auto ipData = serializeString(user.ip);
-    data.insert(data.end(), ipData.begin(), ipData.end());
-    // 序列化managePort
-    data.insert(data.end(), reinterpret_cast<const char*>(&user.managePort),
-                reinterpret_cast<const char*>(&user.managePort) + sizeof(int));
-    return data;
-}
-
-inline UserInfo deserializeUserInfo(const std::vector<char>& data, size_t& offset) {
-    UserInfo user;
-    // 解析userId
-    if (offset + sizeof(int) > data.size()) {
-        throw std::out_of_range("UserID field out of bounds");
-    }
-    user.userId = *reinterpret_cast<const int*>(data.data() + offset);
-    offset += sizeof(int);
-    // 解析昵称
-    user.nickname = deserializeString(data, offset);
-    // 解析头像
-    user.avatar = deserializeVector(data, offset);
-    // 解析dataPort
-    if (offset + sizeof(uint16_t) > data.size()) {
-        throw std::out_of_range("DataPort field out of bounds");
-    }
-    uint16_t port = *reinterpret_cast<const uint16_t*>(data.data() + offset);
-    user.dataPort = ntohs(port);
-    offset += sizeof(uint16_t);
-    // 解析IP
-    user.ip = deserializeString(data, offset);
-    // 解析managePort
-    if (offset + sizeof(int) > data.size()) {
-        throw std::out_of_range("ManagePort field out of bounds");
-    }
-    user.managePort = *reinterpret_cast<const int*>(data.data() + offset);
-    offset += sizeof(int);
-    return user;
-}
-
-// 新增：无offset的deserializeUserInfo（适配客户端调用）
-inline UserInfo deserializeUserInfo(const std::vector<char>& data) {
-    size_t offset = 0;
-    return deserializeUserInfo(data, offset);
-}
-
-// ========== UserList反序列化 ==========
-inline std::map<int, UserInfo> deserializeUserList(const std::vector<char>& data) {
-    std::map<int, UserInfo> userList;
-    size_t offset = 0;
-    // 解析用户数量
-    if (offset + sizeof(uint32_t) > data.size()) {
-        throw std::out_of_range("User count field out of bounds");
-    }
-    uint32_t count = *reinterpret_cast<const uint32_t*>(data.data() + offset);
-    count = ntohl(count);
-    offset += sizeof(uint32_t);
-    
-    for (uint32_t i = 0; i < count; ++i) {
-        UserInfo user = deserializeUserInfo(data, offset);
-        userList[user.userId] = user;
-    }
-    return userList;
-}
-
-// ========== CommonMsg序列化/反序列化（客户端聊天消息） ==========
-inline std::vector<char> serializeCommonMsg(const CommonMsg& msg) {
-    std::vector<char> data;
-    // 严格按照：fromUserId → toUserId → fromNickname → content 的顺序序列化
-    data.insert(data.end(), (char*)&msg.fromUserId, (char*)&msg.fromUserId + sizeof(int));
-    data.insert(data.end(), (char*)&msg.toUserId, (char*)&msg.toUserId + sizeof(int));
-    
-    auto nicknameData = serializeString(msg.fromNickname);
-    data.insert(data.end(), nicknameData.begin(), nicknameData.end());
-    
-    auto contentData = serializeString(msg.content);
-    data.insert(data.end(), contentData.begin(), contentData.end());
-    return data;
-}
-
-inline CommonMsg deserializeCommonMsg(const std::vector<char>& data) {
-    CommonMsg msg;
-    size_t offset = 0;
-    try {
-        // 解析fromUserId
-        if (offset + sizeof(int) > data.size()) {
-            throw std::out_of_range("fromUserId field out of bounds");
-        }
-        msg.fromUserId = *reinterpret_cast<const int*>(data.data() + offset);
-        offset += sizeof(int);
-        // 解析fromNickname
-        msg.fromNickname = deserializeString(data, offset);
-        // 解析content
-        msg.content = deserializeString(data, offset);
-        // 解析toUserId
-        if (offset + sizeof(int) > data.size()) {
-            throw std::out_of_range("toUserId field out of bounds");
-        }
-        msg.toUserId = *reinterpret_cast<const int*>(data.data() + offset);
-        offset += sizeof(int);
-    } catch (const std::exception& e) {
-        std::cerr << "Deserialize CommonMsg failed: " << e.what() << std::endl;
-        msg = CommonMsg{};
-    }
-    return msg;
-}
-
-// ========== 客户端QT版本sendPacket函数 ==========
-inline bool sendPacket(QTcpSocket* socket, uint32_t msgType, const std::vector<char>& data) {
-    PacketHeader header;
-    header.msgType = msgType;
-    header.dataLen = static_cast<uint32_t>(data.size());
-    
-    // 组装发送数据
-    std::vector<char> sendData;
-    sendData.insert(sendData.end(), reinterpret_cast<const char*>(&header),
-                    reinterpret_cast<const char*>(&header) + sizeof(PacketHeader));
-    sendData.insert(sendData.end(), data.begin(), data.end());
-    
-    // QT发送
-    qint64 sent = socket->write(sendData.data(), sendData.size());
-    return sent == sendData.size();
-}
+// Qt客户端sendPacket函数声明
+#if defined(QT_CORE_LIB)
+#include <QTcpSocket>
+bool sendPacket(QTcpSocket* socket, uint32_t msgType, const std::string& data, uint32_t msgId = 0, uint32_t senderId = 0);
+bool sendPacket(QTcpSocket* socket, uint32_t msgType, const QByteArray& data);
+#endif
 
 #endif // PROTOCOL_H

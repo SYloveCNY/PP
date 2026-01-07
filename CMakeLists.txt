@@ -1,39 +1,45 @@
-cmake_minimum_required(VERSION 3.5)
-
-project(chat_server_client)
+cmake_minimum_required(VERSION 3.16)
+project(PP)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 查找Qt6组件（必须包含Core和Widgets）
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
+# 包含头文件目录
+include_directories(${PROJECT_SOURCE_DIR}/include)
 
-# 启用Qt MOC/UIC/RCC
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTORCC ON)
-
-# 源文件列表（根据实际文件调整）
-set(SERVER_SOURCES
+# --------------------------
+# 1. 编译服务器（纯C++，禁用Qt AutoGen）
+# --------------------------
+add_executable(chat_server
     src/server/server.cpp
-    include/protocol_base.h
 )
 
-set(CLIENT_SOURCES
-    src/client_qt/LoginWindow.cpp
-    src/client_qt/ChatWindow.cpp
+set_target_properties(chat_server PROPERTIES
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+)
+
+target_link_libraries(chat_server
+    pthread
+)
+
+# --------------------------
+# 2. 编译客户端（Qt依赖）
+# --------------------------
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
+qt_standard_project_setup()
+
+add_executable(chat_client_qt
     src/client_qt/main.cpp
-    include/protocol_base.h
-    include/protocol_qt.h
+    src/client_qt/LoginWindow.h
+    src/client_qt/LoginWindow.cpp
+    src/client_qt/ChatWindow.h   # 添加ChatWindow头文件
+    src/client_qt/ChatWindow.cpp # 添加ChatWindow源文件
 )
 
-# 服务端可执行文件
-add_executable(chat_server ${SERVER_SOURCES})
-target_include_directories(chat_server PRIVATE include)
-target_link_libraries(chat_server PRIVATE pthread)
-
-# 客户端可执行文件（链接Qt6模块）
-add_executable(chat_client_qt ${CLIENT_SOURCES})
-target_include_directories(chat_client_qt PRIVATE include)
-# 必须链接Qt6::Core/Qt6::Widgets/Qt6::Network
-target_link_libraries(chat_client_qt PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
+target_link_libraries(chat_client_qt
+    Qt6::Core
+    Qt6::Widgets
+    Qt6::Network
+)
