@@ -70,6 +70,7 @@ std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users) {
 // 处理用户列表请求（仅在读取全局数据时加锁）
 // 重构：处理用户列表请求（保证响应格式与登录响应一致）
 void handleUserListReq(int clientFd, const std::string& clientIp) {
+    std::cout << "【用户列表请求】客户端IP：" << clientIp << "，FD：" << clientFd << std::endl;
     (void)clientIp;
     UserListRsp rsp;
     
@@ -90,6 +91,8 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
         userJson["userId"] = user.userId;
         userJson["nickname"] = user.nickname;
         userJson["isOnline"] = user.isOnline;
+        userJson["ip"] = user.ip;
+        userJson["dataPort"] = user.dataPort;
         userArray.push_back(userJson);
     }
     j["users"] = userArray;
@@ -107,6 +110,7 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
     ssize_t headerSend = send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
     ssize_t dataSend = send(clientFd, rspJson.c_str(), rspJson.size(), MSG_NOSIGNAL);
     std::cout << "用户列表响应发送完成：header=" << headerSend << ", data=" << dataSend << std::endl;
+    std::cout << "【用户列表响应】发送成功，在线用户数：" << rsp.users.size() << std::endl;
 }
 
 // 广播函数（仅在读取全局g_fdToUserId时加锁）
@@ -193,18 +197,23 @@ bool handleClient(int clientFd, const std::string& clientIp) {
         switch (msgType) {
             case MsgType::LOGIN_REQ: {
                 std::cout << "LOGIN_REQ" << std::endl;
-                // 1. 解析请求（无需锁，局部操作）
+                // 1. 解析请求（补充ip和dataPort的解析）
                 std::string jsonData(dataBuffer.begin(), dataBuffer.end());
-                LoginReq req = deserializeLoginReq(jsonData);
+                nlohmann::json j = nlohmann::json::parse(jsonData);
+                LoginReq req;
+                req.nickname = j["nickname"];
+                // 提取客户端ip和dataPort（客户端登录请求会携带）
+                std::string clientIpStr = clientIp;
+                int clientDataPort = j.contains("dataPort") ? j["dataPort"].get<int>() : -1;
+
                 LoginRsp rsp;
                 bool nicknameExists = false;
                 int newUserId = -1;
                 std::string newNickname;
                 
-                // 2. 【核心优化】仅访问/修改全局数据时加锁，访问完立即解锁
+                // 2. 加锁操作全局数据（补充ip/dataPort）
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    // 仅做：检查昵称（读全局）+ 创建用户（写全局）
                     for (const auto& [id, user] : g_onlineUsers) {
                         if (user.nickname == req.nickname) {
                             nicknameExists = true;
@@ -218,11 +227,13 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         newUser.userId = newUserId;
                         newUser.nickname = newNickname;
                         newUser.isOnline = true;
+                        newUser.ip = clientIpStr;       // 填充ip
+                        newUser.dataPort = clientDataPort; // 填充dataPort
                         g_onlineUsers[newUserId] = newUser;
                         g_fdToUserId[clientFd] = newUserId;
                     }
-                } // 锁自动解锁，后续逻辑均无锁
-                
+                }
+
                 // 3. 处理登录结果（无需锁，局部操作）
                 std::cout << "1..." << std::endl;
                 if (nicknameExists) {
@@ -283,6 +294,11 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 rspHeader.senderId = htonl(0);
                 send(clientFd, &rspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
                 break; // 注意：不要return false，仅break即可保持连接
+            }
+            case MsgType::COMMON_MSG: {
+                std::cout << "收到普通消息（MsgType::COMMON_MSG），dataLen=" << dataLen << std::endl;
+                // 若需要转发普通消息，可在此实现逻辑
+                break;
             }
             default:
                 std::cout << "未知消息类型: " << (int)msgType << std::endl;

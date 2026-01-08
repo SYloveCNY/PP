@@ -30,6 +30,8 @@ private slots:
     void sendMessage();
     // 打开图片选择对话框
     void sendImageDialog();
+    // 获取在线用户
+    void getOnlineUserList();
 
 private:
     // 初始化UI

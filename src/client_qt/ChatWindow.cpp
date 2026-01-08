@@ -80,6 +80,10 @@ void ChatWindow::initUI() {
     m_userInfoLabel = new QLabel(this);
     mainLayout->addWidget(m_userInfoLabel);
 
+    // 新增：获取在线用户按钮
+    QPushButton* getUserListBtn = new QPushButton("获取在线用户", this);
+    mainLayout->addWidget(getUserListBtn);
+
     // 2. 聊天记录框
     m_chatRecordEdit = new QTextEdit(this);
     m_chatRecordEdit->setReadOnly(true);
@@ -97,6 +101,7 @@ void ChatWindow::initUI() {
     mainLayout->addLayout(inputLayout);
 
     // 连接按钮信号
+    connect(getUserListBtn, &QPushButton::clicked, this, &ChatWindow::getOnlineUserList);
     connect(sendBtn, &QPushButton::clicked, this, &ChatWindow::sendMessage);
     connect(sendImgBtn, &QPushButton::clicked, this, &ChatWindow::sendImageDialog);
 }
@@ -146,16 +151,41 @@ void ChatWindow::onServerReadyRead() {
             // updateUserList(); 
             break;
         }
-        case MsgType::USER_LIST_RSP: {
-            UserListRsp rsp = deserialize<UserListRsp>(dataStr);
-            updateUserList(rsp.users);
+        case MsgType::USER_LIST_RSP: { // 修复解析逻辑
+            try {
+                nlohmann::json rspJson = nlohmann::json::parse(dataStr);
+                int userCount = rspJson["userCount"];
+                auto usersJson = rspJson["users"];
+
+                // 手动解析用户列表（对齐服务器返回结构）
+                std::vector<UserInfo> users;
+                for (auto& userJson : usersJson) {
+                    UserInfo user;
+                    user.userId = userJson["userId"];
+                    user.nickname = userJson["nickname"];
+                    user.isOnline = userJson["isOnline"];
+                    user.ip = userJson.contains("ip") ? userJson["ip"].get<std::string>() : "";
+                    user.dataPort = userJson.contains("dataPort") ? userJson["dataPort"].get<int>() : 0;
+                    users.push_back(user);
+                }
+
+                // 更新UI显示
+                updateUserList(users);
+            } catch (std::exception& e) {
+                showMessage("解析错误", QString("解析用户列表失败：%1").arg(e.what()));
+            }
             break;
         }
         case MsgType::COMMON_MSG: {
             showMessage("服务器", QString::fromStdString(dataStr));
             break;
         }
+        case MsgType::HEARTBEAT: { // 新增：处理服务器返回的心跳响应
+            showMessage("系统提示", "心跳包响应正常");
+            break;
+        }
         default:
+            showMessage("未知消息", QString("收到未知消息类型：%1").arg((int)msgType));
             break;
     }
 }
@@ -164,11 +194,16 @@ void ChatWindow::onServerReadyRead() {
 void ChatWindow::updateUserList(const std::vector<UserInfo>& users) {
     QString userListStr = "在线用户：\n";
     for (const auto& user : users) {
+        // 处理IP为空
+        QString ipStr = user.ip.empty() ? "未知" : QString::fromStdString(user.ip);
+        // 处理端口为0/-1
+        QString portStr = (user.dataPort <= 0) ? "无" : QString::number(user.dataPort);
+        
         userListStr += QString("%1（ID：%2，IP：%3，端口：%4）\n")
             .arg(QString::fromStdString(user.nickname))
             .arg(user.userId)
-            .arg(QString::fromStdString(user.ip))
-            .arg(user.dataPort);
+            .arg(ipStr)
+            .arg(portStr);
     }
     m_chatRecordEdit->append(userListStr);
 }
@@ -229,4 +264,27 @@ void ChatWindow::showMessage(const QString& sender, const QString& content) {
         .arg(sender)
         .arg(content);
     m_chatRecordEdit->append(msg);
+}
+
+// 获取在线用户
+void ChatWindow::getOnlineUserList() {
+    if (!m_socket || m_socket->state() != QTcpSocket::ConnectedState) {
+        showMessage("系统提示", "未连接到服务器，无法获取在线用户！");
+        return;
+    }
+
+    // 发送USER_LIST_REQ（msgType=3），无数据体
+    bool ret = sendPacket(
+        m_socket, 
+        static_cast<uint32_t>(MsgType::USER_LIST_REQ), 
+        "",  // 无数据体
+        nextMsgId++, 
+        m_userId
+    );
+
+    if (ret) {
+        showMessage("系统提示", "已发送在线用户列表请求，请等待响应...");
+    } else {
+        showMessage("系统提示", "发送在线用户列表请求失败！");
+    }
 }
