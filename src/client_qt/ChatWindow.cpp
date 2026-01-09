@@ -1,4 +1,5 @@
 #include "ChatWindow.h"
+#include "ui_ChatWindow.h" 
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QTextEdit>
@@ -43,19 +44,32 @@ ChatWindow::ChatWindow(QWidget *parent)
     , m_userId(0)
     , m_socket(nullptr)
     , m_heartbeatTimer(new QTimer(this))
+    , ui(new Ui::ChatWindow) // 初始化UI对象
 {
+    // 加载UI文件（替代手动创建UI）
+    ui->setupUi(this);
     this->setWindowTitle("聊天窗口");
-    this->setFixedSize(600, 400);
 
-    // 初始化UI
-    initUI();
+    // 新增：添加“获取在线用户”按钮到在线用户分组框
+    QPushButton* getUserListBtn = new QPushButton("获取在线用户", this);
+    ui->groupBox_onlineUsers->layout()->addWidget(getUserListBtn);
 
-    // 初始化心跳定时器（30秒一次）
+    // 新增：添加用户信息标签到聊天区域顶部
+    m_userInfoLabel = new QLabel("当前用户：未登录", this);
+    ui->verticalLayout->insertWidget(0, m_userInfoLabel); // 插入到聊天框上方
+
+    // 绑定信号槽（适配UI文件的控件）
+    connect(getUserListBtn, &QPushButton::clicked, this, &ChatWindow::getOnlineUserList);
+    connect(ui->pushButton_send, &QPushButton::clicked, this, &ChatWindow::sendMessage);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatWindow::sendHeartbeat);
+    
+    // 启动心跳定时器
     m_heartbeatTimer->start(30000);
 }
 
-ChatWindow::~ChatWindow() = default;
+ChatWindow::~ChatWindow() {
+    delete ui; // 释放UI对象
+}
 
 // 设置登录信息
 void ChatWindow::setLoginInfo(int userId, const QString& nickname, QTcpSocket* socket) {
@@ -70,40 +84,6 @@ void ChatWindow::setLoginInfo(int userId, const QString& nickname, QTcpSocket* s
 
     // 连接Socket的readyRead信号
     connect(m_socket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
-}
-
-// 初始化UI
-void ChatWindow::initUI() {
-    QVBoxLayout* mainLayout = new QVBoxLayout(this);
-
-    // 1. 用户信息标签
-    m_userInfoLabel = new QLabel(this);
-    mainLayout->addWidget(m_userInfoLabel);
-
-    // 新增：获取在线用户按钮
-    QPushButton* getUserListBtn = new QPushButton("获取在线用户", this);
-    mainLayout->addWidget(getUserListBtn);
-
-    // 2. 聊天记录框
-    m_chatRecordEdit = new QTextEdit(this);
-    m_chatRecordEdit->setReadOnly(true);
-    mainLayout->addWidget(m_chatRecordEdit);
-
-    // 3. 输入区域
-    QHBoxLayout* inputLayout = new QHBoxLayout();
-    m_inputEdit = new QLineEdit(this);
-    QPushButton* sendBtn = new QPushButton("发送", this);
-    QPushButton* sendImgBtn = new QPushButton("发送图片", this);
-
-    inputLayout->addWidget(m_inputEdit);
-    inputLayout->addWidget(sendBtn);
-    inputLayout->addWidget(sendImgBtn);
-    mainLayout->addLayout(inputLayout);
-
-    // 连接按钮信号
-    connect(getUserListBtn, &QPushButton::clicked, this, &ChatWindow::getOnlineUserList);
-    connect(sendBtn, &QPushButton::clicked, this, &ChatWindow::sendMessage);
-    connect(sendImgBtn, &QPushButton::clicked, this, &ChatWindow::sendImageDialog);
 }
 
 // 发送心跳包
@@ -203,20 +183,25 @@ void ChatWindow::onServerReadyRead() {
 
 // 更新用户列表（简化实现）
 void ChatWindow::updateUserList(const std::vector<UserInfo>& users) {
-    QString userListStr = "在线用户：\n";
+    // 清空在线用户列表控件
+    ui->listWidget_onlineUsers->clear();
+    
+    // 遍历添加用户到列表
     for (const auto& user : users) {
-        // 处理IP为空
         QString ipStr = user.ip.empty() ? "未知" : QString::fromStdString(user.ip);
-        // 处理端口为0/-1
         QString portStr = (user.dataPort <= 0) ? "无" : QString::number(user.dataPort);
         
-        userListStr += QString("%1（ID：%2，IP：%3，端口：%4）\n")
+        QString itemText = QString("%1（ID：%2，IP：%3，端口：%4）")
             .arg(QString::fromStdString(user.nickname))
             .arg(user.userId)
             .arg(ipStr)
             .arg(portStr);
+        
+        ui->listWidget_onlineUsers->addItem(itemText);
     }
-    m_chatRecordEdit->append(userListStr);
+    
+    // 聊天框提示更新结果
+    showMessage("系统提示", QString("在线用户列表已更新，当前在线%1人").arg(users.size()));
 }
 
 // 处理通知（上线/下线）
@@ -232,7 +217,7 @@ void ChatWindow::processNotification(const MsgType& type, const std::string& dat
 
 // 发送普通消息
 void ChatWindow::sendMessage() {
-    QString content = m_inputEdit->text().trimmed();
+    QString content = ui->lineEdit_input->text().trimmed();
     if (content.isEmpty() || !m_socket) return;
 
     // 封装为JSON（仅传内容，发送方信息服务端从全局获取）
@@ -245,7 +230,7 @@ void ChatWindow::sendMessage() {
 
     // 显示自己发送的消息
     showMessage(m_nickname, content);
-    m_inputEdit->clear();
+    ui->lineEdit_input->clear();
 }
 
 // 打开图片选择对话框并发送
@@ -273,12 +258,13 @@ void ChatWindow::sendImage(const QString& filePath) {
     showMessage(m_nickname, QString("发送图片：%1").arg(filePath));
 }
 
-// 显示聊天消息（仅保留一个实现，解决重复定义）
+// 显示聊天消息
 void ChatWindow::showMessage(const QString& sender, const QString& content) {
     QString msg = QString("[%1] %2：%3").arg(QTime::currentTime().toString())
         .arg(sender)
         .arg(content);
-    m_chatRecordEdit->append(msg);
+    // 改用UI文件的聊天日志框
+    ui->textEdit_chatLog->append(msg);
 }
 
 // 获取在线用户

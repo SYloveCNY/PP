@@ -34,8 +34,11 @@ add_executable(chat_client_qt
     src/client_qt/main.cpp
     src/client_qt/LoginWindow.h
     src/client_qt/LoginWindow.cpp
+    src/client_qt/LoginWindow.ui
     src/client_qt/ChatWindow.h   # 添加ChatWindow头文件
     src/client_qt/ChatWindow.cpp # 添加ChatWindow源文件
+    src/client_qt/ChatWindow.ui # 添加.ui文件
+
 )
 
 target_link_libraries(chat_client_qt

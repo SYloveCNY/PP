@@ -5,11 +5,17 @@
 #include <QTcpSocket>
 #include <QString>
 #include <QTimer>
+#include <QListWidget>
 #include "../../include/protocol.h"
+
+namespace Ui {
+class ChatWindow;
+}
 
 class QLabel;
 class QTextEdit;
 class QLineEdit;
+class QPushButton;
 
 class ChatWindow : public QWidget {
     Q_OBJECT
@@ -34,8 +40,6 @@ private slots:
     void getOnlineUserList();
 
 private:
-    // 初始化UI
-    void initUI();
     // 更新用户列表
     void updateUserList(const std::vector<UserInfo>& users);
     // 处理上线/下线通知
@@ -50,11 +54,8 @@ private:
     QString m_nickname;
     QTcpSocket* m_socket = nullptr;
     QTimer* m_heartbeatTimer = nullptr; // 心跳定时器
-
-    // UI控件
+    Ui::ChatWindow* ui;
     QLabel* m_userInfoLabel = nullptr;
-    QTextEdit* m_chatRecordEdit = nullptr;
-    QLineEdit* m_inputEdit = nullptr;
 };
 
 #endif // CHATWINDOW_H
