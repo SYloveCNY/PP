@@ -297,7 +297,40 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             }
             case MsgType::COMMON_MSG: {
                 std::cout << "收到普通消息（MsgType::COMMON_MSG），dataLen=" << dataLen << std::endl;
-                // 若需要转发普通消息，可在此实现逻辑
+                
+                // 1. 读取客户端发送的JSON，提取content字段（关键修复：避免二次封装）
+                std::string clientMsgJson(dataBuffer.begin(), dataBuffer.end());
+                std::string realContent = "";
+                try {
+                    nlohmann::json j = nlohmann::json::parse(clientMsgJson);
+                    realContent = j["content"]; // 提取纯文本内容
+                } catch (...) {
+                    realContent = clientMsgJson; // 解析失败则用原始内容
+                }
+
+                // 2. 获取发送方的userId和nickname（加锁读取全局数据）
+                int senderUserId = -1;
+                std::string senderNickname = "未知用户";
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    auto fdIt = g_fdToUserId.find(clientFd);
+                    if (fdIt != g_fdToUserId.end()) {
+                        senderUserId = fdIt->second;
+                        auto userIt = g_onlineUsers.find(senderUserId);
+                        if (userIt != g_onlineUsers.end()) {
+                            senderNickname = userIt->second.nickname;
+                        }
+                    }
+                }
+                
+                // 3. 封装转发消息（仅包含发送方+纯文本，而非嵌套JSON）
+                nlohmann::json forwardJson;
+                forwardJson["senderNickname"] = senderNickname;
+                forwardJson["content"] = realContent; // 纯文本，不是JSON字符串
+                std::string forwardData = forwardJson.dump();
+                
+                // 4. 广播转发（排除发送方自己）
+                broadcast(forwardData, static_cast<uint32_t>(MsgType::COMMON_MSG), clientFd);
                 break;
             }
             default:

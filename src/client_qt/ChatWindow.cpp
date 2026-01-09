@@ -177,7 +177,18 @@ void ChatWindow::onServerReadyRead() {
             break;
         }
         case MsgType::COMMON_MSG: {
-            showMessage("服务器", QString::fromStdString(dataStr));
+            try {
+                // 解析服务端转发的JSON消息
+                nlohmann::json msgJson = nlohmann::json::parse(dataStr);
+                std::string senderNickname = msgJson["senderNickname"];
+                std::string content = msgJson["content"];
+                
+                // 显示真实发送方的消息（而非“服务器”）
+                showMessage(QString::fromStdString(senderNickname), QString::fromStdString(content));
+            } catch (std::exception& e) {
+                // 兼容旧逻辑：解析失败则显示原始内容
+                showMessage("未知用户", QString::fromStdString(dataStr));
+            }
             break;
         }
         case MsgType::HEARTBEAT: { // 新增：处理服务器返回的心跳响应
@@ -224,8 +235,12 @@ void ChatWindow::sendMessage() {
     QString content = m_inputEdit->text().trimmed();
     if (content.isEmpty() || !m_socket) return;
 
-    // 序列化消息
-    std::string data = content.toStdString();
+    // 封装为JSON（仅传内容，发送方信息服务端从全局获取）
+    nlohmann::json msgJson;
+    msgJson["content"] = content.toStdString(); // 仅传消息内容
+    std::string data = msgJson.dump();
+
+    // 发送消息（msgType仍为COMMON_MSG）
     sendPacket(m_socket, static_cast<uint32_t>(MsgType::COMMON_MSG), data, nextMsgId++, m_userId);
 
     // 显示自己发送的消息
