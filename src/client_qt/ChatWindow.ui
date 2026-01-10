@@ -15,7 +15,6 @@
   </property>
   <layout class="QHBoxLayout" name="horizontalLayout">
    <item>
-    <!-- 用 QGroupBox 包裹 QListWidget，设置标题 -->
     <widget class="QGroupBox" name="groupBox_onlineUsers">
      <property name="title">
       <string>在线用户</string>
@@ -35,6 +34,27 @@
         <bool>true</bool>
        </property>
       </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="horizontalLayout_2">
+       <item>
+        <widget class="QLabel" name="label">
+         <property name="text">
+          <string>私聊对象ID：</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="lineEdit_privateId"/>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_switchChatType">
+         <property name="text">
+          <string>公聊</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
      </item>
      <item>
       <widget class="QLineEdit" name="lineEdit_input"/>

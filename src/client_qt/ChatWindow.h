@@ -38,6 +38,8 @@ private slots:
     void sendImageDialog();
     // 获取在线用户
     void getOnlineUserList();
+    // 切换聊天类型（公聊/私聊）
+    void switchChatType();
 
 private:
     // 更新用户列表
@@ -47,7 +49,7 @@ private:
     // 发送图片
     void sendImage(const QString& filePath);
     // 显示聊天消息（仅一个实现）
-    void showMessage(const QString& sender, const QString& content);
+    void showMessage(const QString& sender, const QString& content, bool isPrivate = false);
 
     // 成员变量
     int m_userId = 0;
@@ -56,6 +58,7 @@ private:
     QTimer* m_heartbeatTimer = nullptr; // 心跳定时器
     Ui::ChatWindow* ui;
     QLabel* m_userInfoLabel = nullptr;
+    bool m_isPrivateChat = false;
 };
 
 #endif // CHATWINDOW_H

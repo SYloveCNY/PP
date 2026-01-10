@@ -23,7 +23,7 @@ struct PacketHeader {
     uint32_t senderId;   // 发送者ID（缺失的成员）
 };
 
-// 消息类型枚举（包含所有用到的类型）
+// 消息类型枚举（包含所有用到的类型，新增私聊类型）
 enum class MsgType : uint32_t {
     LOGIN_REQ = 1,          
     LOGIN_RSP = 2,          
@@ -35,7 +35,9 @@ enum class MsgType : uint32_t {
     USER_ONLINE_NOTIFY = 8, 
     USER_OFFLINE_NOTIFY = 9,
     IMAGE_MSG = 11,         
-    FILE_MSG = 12           
+    FILE_MSG = 12,          
+    PRIVATE_MSG = 13,       // 新增：私聊消息
+    PRIVATE_MSG_RSP = 14    // 新增：私聊响应
 };
 
 // 用户信息结构体（包含ip和dataPort）
@@ -70,6 +72,20 @@ struct UserStatusNotify {
     bool isOnline;          
 };
 
+// ========== 新增：私聊消息结构体 ==========
+struct PrivateMsg {
+    int senderId;       // 发送方ID
+    int receiverId;     // 接收方ID
+    std::string content;// 消息内容
+};
+
+// ========== 新增：私聊响应结构体 ==========
+struct PrivateMsgRsp {
+    bool success;       // 是否成功
+    std::string msg;    // 提示信息（如“用户不在线”）
+    int receiverId;     // 接收方ID
+};
+
 // 图片消息（包含fileName/fileSize/base64Data）
 struct ImageMsg {
     int senderId;           
@@ -91,7 +107,7 @@ struct FileMsg {
     std::string base64Data;  // Base64编码的文件数据片段
 };
 
-// JSON序列化特化（所有结构体）
+// JSON序列化特化（所有结构体，新增私聊结构体的特化）
 namespace nlohmann {
 template <> struct adl_serializer<UserInfo> {
     static void to_json(json& j, const UserInfo& u) {
@@ -136,6 +152,30 @@ template <> struct adl_serializer<UserStatusNotify> {
         j.at("userId").get_to(notify.userId);
         j.at("nickname").get_to(notify.nickname);
         j.at("isOnline").get_to(notify.isOnline);
+    }
+};
+
+// ========== 新增：PrivateMsg序列化特化 ==========
+template <> struct adl_serializer<PrivateMsg> {
+    static void to_json(json& j, const PrivateMsg& msg) {
+        j = json{{"senderId", msg.senderId}, {"receiverId", msg.receiverId}, {"content", msg.content}};
+    }
+    static void from_json(const json& j, PrivateMsg& msg) {
+        j.at("senderId").get_to(msg.senderId);
+        j.at("receiverId").get_to(msg.receiverId);
+        j.at("content").get_to(msg.content);
+    }
+};
+
+// ========== 新增：PrivateMsgRsp序列化特化 ==========
+template <> struct adl_serializer<PrivateMsgRsp> {
+    static void to_json(json& j, const PrivateMsgRsp& rsp) {
+        j = json{{"success", rsp.success}, {"msg", rsp.msg}, {"receiverId", rsp.receiverId}};
+    }
+    static void from_json(const json& j, PrivateMsgRsp& rsp) {
+        j.at("success").get_to(rsp.success);
+        j.at("msg").get_to(rsp.msg);
+        j.at("receiverId").get_to(rsp.receiverId);
     }
 };
 

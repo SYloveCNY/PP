@@ -19,6 +19,36 @@ int g_nextUserId = 1;
 std::map<int, int> g_fdToUserId; 
 std::mutex g_mutex; // 非递归锁，仅保护全局数据读写
 
+// 根据用户ID查找对应的客户端FD（加锁读取）
+int findFdByUserId(int userId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto& [fd, uid] : g_fdToUserId) {
+        if (uid == userId) {
+            return fd;
+        }
+    }
+    return -1; // 用户不在线
+}
+
+// 序列化私聊消息
+std::string serializePrivateMsg(const PrivateMsg& msg) {
+    nlohmann::json j;
+    j["senderId"] = msg.senderId;
+    j["receiverId"] = msg.receiverId;
+    j["content"] = msg.content;
+    j["senderNickname"] = g_onlineUsers[msg.senderId].nickname; // 补充发送方昵称
+    return j.dump();
+}
+
+// 序列化私聊响应
+std::string serializePrivateMsgRsp(const PrivateMsgRsp& rsp) {
+    nlohmann::json j;
+    j["success"] = rsp.success;
+    j["msg"] = rsp.msg;
+    j["receiverId"] = rsp.receiverId;
+    return j.dump();
+}
+
 void broadcast(const std::string& data, uint32_t msgType, int excludeFd = -1);
 void handleClientThread(int clientFd, const std::string& clientIp);
 
@@ -331,6 +361,78 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 
                 // 4. 广播转发（排除发送方自己）
                 broadcast(forwardData, static_cast<uint32_t>(MsgType::COMMON_MSG), clientFd);
+                break;
+            }
+            case MsgType::PRIVATE_MSG: {
+                std::cout << "收到私聊消息（MsgType::PRIVATE_MSG），dataLen=" << dataLen << std::endl;
+                
+                // 1. 解析私聊消息
+                std::string clientMsgJson(dataBuffer.begin(), dataBuffer.end());
+                PrivateMsg msg;
+                try {
+                    nlohmann::json j = nlohmann::json::parse(clientMsgJson);
+                    msg.senderId = j["senderId"];
+                    msg.receiverId = j["receiverId"];
+                    msg.content = j["content"];
+                } catch (...) {
+                    std::cout << "私聊消息解析失败" << std::endl;
+                    break;
+                }
+
+                // 2. 查找接收方FD（加锁）
+                int receiverFd = findFdByUserId(msg.receiverId);
+                PrivateMsgRsp rsp;
+                rsp.receiverId = msg.receiverId;
+
+                if (receiverFd == -1) {
+                    // 接收方不在线，返回失败响应
+                    rsp.success = false;
+                    rsp.msg = "用户不在线，无法发送私聊消息";
+                    std::string rspJson = serializePrivateMsgRsp(rsp);
+                    
+                    // 构造响应头部
+                    PacketHeader rspHeader;
+                    rspHeader.msgType = static_cast<uint32_t>(MsgType::PRIVATE_MSG_RSP);
+                    rspHeader.dataLen = rspJson.size();
+                    rspHeader.msgId = 0;
+                    rspHeader.senderId = 0;
+                    PacketHeader netRspHeader = htonHeader(rspHeader);
+                    
+                    // 发送响应给发送方
+                    send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
+                    send(clientFd, rspJson.c_str(), rspJson.size(), MSG_NOSIGNAL);
+                    std::cout << "私聊失败：接收方ID=" << msg.receiverId << " 不在线" << std::endl;
+                } else {
+                    // 接收方在线，发送私聊消息
+                    std::string forwardData = serializePrivateMsg(msg);
+                    
+                    // 构造私聊消息头部
+                    PacketHeader header;
+                    header.msgType = static_cast<uint32_t>(MsgType::PRIVATE_MSG);
+                    header.dataLen = forwardData.size();
+                    header.msgId = 0;
+                    header.senderId = msg.senderId;
+                    PacketHeader netHeader = htonHeader(header);
+                    
+                    // 仅向接收方FD发送
+                    send(receiverFd, &netHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
+                    send(receiverFd, forwardData.c_str(), forwardData.size(), MSG_NOSIGNAL);
+                    
+                    // 返回成功响应给发送方
+                    rsp.success = true;
+                    rsp.msg = "私聊消息发送成功";
+                    std::string rspJson = serializePrivateMsgRsp(rsp);
+                    PacketHeader rspHeader;
+                    rspHeader.msgType = static_cast<uint32_t>(MsgType::PRIVATE_MSG_RSP);
+                    rspHeader.dataLen = rspJson.size();
+                    rspHeader.msgId = 0;
+                    rspHeader.senderId = 0;
+                    PacketHeader netRspHeader = htonHeader(rspHeader);
+                    send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
+                    send(clientFd, rspJson.c_str(), rspJson.size(), MSG_NOSIGNAL);
+                    
+                    std::cout << "私聊成功：发送方ID=" << msg.senderId << " → 接收方ID=" << msg.receiverId << std::endl;
+                }
                 break;
             }
             default:

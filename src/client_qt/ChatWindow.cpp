@@ -45,22 +45,24 @@ ChatWindow::ChatWindow(QWidget *parent)
     , m_socket(nullptr)
     , m_heartbeatTimer(new QTimer(this))
     , ui(new Ui::ChatWindow) // 初始化UI对象
+    , m_isPrivateChat(false) // 初始为公聊
 {
     // 加载UI文件（替代手动创建UI）
     ui->setupUi(this);
     this->setWindowTitle("聊天窗口");
 
-    // 新增：添加“获取在线用户”按钮到在线用户分组框
+    // 添加“获取在线用户”按钮到在线用户分组框
     QPushButton* getUserListBtn = new QPushButton("获取在线用户", this);
     ui->groupBox_onlineUsers->layout()->addWidget(getUserListBtn);
 
-    // 新增：添加用户信息标签到聊天区域顶部
+    // 添加用户信息标签到聊天区域顶部
     m_userInfoLabel = new QLabel("当前用户：未登录", this);
     ui->verticalLayout->insertWidget(0, m_userInfoLabel); // 插入到聊天框上方
 
-    // 绑定信号槽（适配UI文件的控件）
+    // 适配UI文件的控件）
     connect(getUserListBtn, &QPushButton::clicked, this, &ChatWindow::getOnlineUserList);
     connect(ui->pushButton_send, &QPushButton::clicked, this, &ChatWindow::sendMessage);
+    connect(ui->pushButton_switchChatType, &QPushButton::clicked, this, &ChatWindow::switchChatType);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatWindow::sendHeartbeat);
     
     // 启动心跳定时器
@@ -156,6 +158,29 @@ void ChatWindow::onServerReadyRead() {
             }
             break;
         }
+        case MsgType::PRIVATE_MSG: {
+            try {
+                nlohmann::json msgJson = nlohmann::json::parse(dataStr);
+                std::string senderNickname = msgJson["senderNickname"];
+                std::string content = msgJson["content"];
+                // 显示私聊消息，标记为私聊
+                showMessage(QString::fromStdString(senderNickname) + "(私聊)", QString::fromStdString(content), true);
+            } catch (std::exception& e) {
+                showMessage("未知用户", QString::fromStdString(dataStr));
+            }
+            break;
+        }
+        case MsgType::PRIVATE_MSG_RSP: {
+            try {
+                nlohmann::json rspJson = nlohmann::json::parse(dataStr);
+                bool success = rspJson["success"];
+                std::string msg = rspJson["msg"];
+                showMessage("系统提示", QString::fromStdString(msg));
+            } catch (std::exception& e) {
+                showMessage("系统提示", "私聊响应解析失败");
+            }
+            break;
+        }
         case MsgType::COMMON_MSG: {
             try {
                 // 解析服务端转发的JSON消息
@@ -220,16 +245,43 @@ void ChatWindow::sendMessage() {
     QString content = ui->lineEdit_input->text().trimmed();
     if (content.isEmpty() || !m_socket) return;
 
-    // 封装为JSON（仅传内容，发送方信息服务端从全局获取）
-    nlohmann::json msgJson;
-    msgJson["content"] = content.toStdString(); // 仅传消息内容
-    std::string data = msgJson.dump();
+    if (m_isPrivateChat) {
+        // 私聊逻辑
+        bool ok;
+        int receiverId = ui->lineEdit_privateId->text().toInt(&ok);
+        if (!ok || receiverId <= 0) {
+            showMessage("系统提示", "请输入有效的私聊对象ID！");
+            return;
+        }
 
-    // 发送消息（msgType仍为COMMON_MSG）
-    sendPacket(m_socket, static_cast<uint32_t>(MsgType::COMMON_MSG), data, nextMsgId++, m_userId);
+        // 构造私聊消息
+        PrivateMsg msg;
+        msg.senderId = m_userId;
+        msg.receiverId = receiverId;
+        msg.content = content.toStdString();
 
-    // 显示自己发送的消息
-    showMessage(m_nickname, content);
+        // 序列化
+        nlohmann::json j;
+        j["senderId"] = msg.senderId;
+        j["receiverId"] = msg.receiverId;
+        j["content"] = msg.content;
+        std::string data = j.dump();
+
+        // 发送私聊消息
+        sendPacket(m_socket, static_cast<uint32_t>(MsgType::PRIVATE_MSG), data, nextMsgId++, m_userId);
+
+        // 显示自己发送的私聊消息
+        showMessage(m_nickname + "(私聊→" + QString::number(receiverId) + ")", content, true);
+    } else {
+        // 原有公聊逻辑
+        nlohmann::json msgJson;
+        msgJson["content"] = content.toStdString();
+        std::string data = msgJson.dump();
+
+        sendPacket(m_socket, static_cast<uint32_t>(MsgType::COMMON_MSG), data, nextMsgId++, m_userId);
+        showMessage(m_nickname, content);
+    }
+
     ui->lineEdit_input->clear();
 }
 
@@ -259,11 +311,12 @@ void ChatWindow::sendImage(const QString& filePath) {
 }
 
 // 显示聊天消息
-void ChatWindow::showMessage(const QString& sender, const QString& content) {
-    QString msg = QString("[%1] %2：%3").arg(QTime::currentTime().toString())
+void ChatWindow::showMessage(const QString& sender, const QString& content, bool isPrivate) {
+    QString prefix = isPrivate ? "[私聊] " : "";
+    QString msg = QString("[%1] %2%3：%4").arg(QTime::currentTime().toString())
+        .arg(prefix)
         .arg(sender)
         .arg(content);
-    // 改用UI文件的聊天日志框
     ui->textEdit_chatLog->append(msg);
 }
 
@@ -287,5 +340,17 @@ void ChatWindow::getOnlineUserList() {
         showMessage("系统提示", "已发送在线用户列表请求，请等待响应...");
     } else {
         showMessage("系统提示", "发送在线用户列表请求失败！");
+    }
+}
+
+// 切换聊天类型函数
+void ChatWindow::switchChatType() {
+    m_isPrivateChat = !m_isPrivateChat;
+    if (m_isPrivateChat) {
+        ui->pushButton_switchChatType->setText("私聊");
+        ui->lineEdit_privateId->setEnabled(true); // 启用私聊ID输入
+    } else {
+        ui->pushButton_switchChatType->setText("公聊");
+        ui->lineEdit_privateId->setEnabled(false); // 禁用私聊ID输入
     }
 }
