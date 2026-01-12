@@ -6,6 +6,7 @@
 #include <QString>
 #include <QTimer>
 #include <QListWidget>
+#include <QCloseEvent>
 #include "../../include/protocol.h"
 
 namespace Ui {
@@ -27,6 +28,9 @@ public:
     // 设置登录信息
     void setLoginInfo(int userId, const QString& nickname, QTcpSocket* socket);
 
+protected:
+    void closeEvent(QCloseEvent *event) override; // 新增
+    
 private slots:
     // 发送心跳包
     void sendHeartbeat();

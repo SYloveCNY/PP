@@ -10,6 +10,8 @@
 #include <thread>
 #include <mutex>
 #include <cerrno> // 新增：用于错误码打印
+#include <chrono> // 新增：心跳时间戳
+#include <fcntl.h>
 #include "../../include/protocol.h"
 #include "../../include/json/json.hpp"
 
@@ -18,6 +20,26 @@ std::map<int, UserInfo> g_onlineUsers;
 int g_nextUserId = 1;
 std::map<int, int> g_fdToUserId; 
 std::mutex g_mutex; // 非递归锁，仅保护全局数据读写
+// 新增：心跳相关
+std::map<int, std::chrono::steady_clock::time_point> g_fdLastHeartbeat;
+const int HEARTBEAT_TIMEOUT_SEC = 15;
+std::thread g_heartbeatCheckThread;
+bool g_isRunning = true;
+
+// 函数声明
+void broadcast(const std::string& data, uint32_t msgType, int excludeFd = -1);
+void heartbeatCheckThread();
+void handleClientThread(int clientFd, const std::string& clientIp);
+int findFdByUserId(int userId);
+std::string serializePrivateMsg(const PrivateMsg& msg);
+std::string serializePrivateMsgRsp(const PrivateMsgRsp& rsp);
+LoginReq deserializeLoginReq(const std::string& jsonStr);
+std::string serializeLoginRsp(const LoginRsp& rsp);
+std::string serializeUserListRsp(const UserListRsp& rsp);
+std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users);
+void handleUserListReq(int clientFd, const std::string& clientIp);
+bool handleClient(int clientFd, const std::string& clientIp);
+
 
 // 根据用户ID查找对应的客户端FD（加锁读取）
 int findFdByUserId(int userId) {
@@ -49,8 +71,54 @@ std::string serializePrivateMsgRsp(const PrivateMsgRsp& rsp) {
     return j.dump();
 }
 
-void broadcast(const std::string& data, uint32_t msgType, int excludeFd = -1);
-void handleClientThread(int clientFd, const std::string& clientIp);
+// 心跳检测线程
+void heartbeatCheckThread() {
+    while (g_isRunning) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto it = g_fdLastHeartbeat.begin(); it != g_fdLastHeartbeat.end();) {
+            int clientFd = it->first;
+            auto lastTime = it->second;
+            auto now = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
+            
+            if (duration.count() > HEARTBEAT_TIMEOUT_SEC) {
+                std::cout << "客户端FD=" << clientFd << " 心跳超时，判定为意外退出" << std::endl;
+                int offlineUserId = -1;
+                std::string offlineNickname = "";
+                
+                // 1. 先获取用户信息（避免erase后丢失）
+                auto fdIt = g_fdToUserId.find(clientFd);
+                if (fdIt != g_fdToUserId.end()) {
+                    offlineUserId = fdIt->second;
+                    auto userIt = g_onlineUsers.find(offlineUserId);
+                    if (userIt != g_onlineUsers.end()) {
+                        offlineNickname = userIt->second.nickname;
+                        // 广播下线通知
+                        UserStatusNotify notify;
+                        notify.userId = offlineUserId;
+                        notify.nickname = offlineNickname;
+                        notify.isOnline = false;
+                        std::string notifyData = serialize(notify);
+                        broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                        
+                        // 2. 彻底清理用户数据（关键）
+                        g_onlineUsers.erase(userIt); // 删除用户信息
+                        std::cout << "清理离线用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
+                    }
+                    g_fdToUserId.erase(fdIt); // 删除FD映射
+                }
+                
+                // 3. 关闭连接+清理心跳记录
+                close(clientFd);
+                it = g_fdLastHeartbeat.erase(it);
+                std::cout << "心跳超时用户清理完成：FD=" << clientFd << std::endl;
+            } else {
+                ++it;
+            }
+        }
+    }
+}
 
 // 登录请求反序列化（无全局操作，无需锁）
 LoginReq deserializeLoginReq(const std::string& jsonStr) {
@@ -72,7 +140,18 @@ std::string serializeLoginRsp(const LoginRsp& rsp) {
 // 用户列表响应序列化（无全局操作，无需锁）
 std::string serializeUserListRsp(const UserListRsp& rsp) {
     nlohmann::json j;
-    j["users"] = rsp.users;
+    j["userCount"] = rsp.users.size(); // 补充client期望的userCount字段
+    nlohmann::json userArray = nlohmann::json::array();
+    for (const auto& user : rsp.users) {
+        nlohmann::json userJson;
+        userJson["userId"] = user.userId;
+        userJson["nickname"] = user.nickname;
+        userJson["isOnline"] = user.isOnline;
+        userJson["ip"] = user.ip.empty() ? "" : user.ip; // 避免null
+        userJson["dataPort"] = user.dataPort <= 0 ? 0 : user.dataPort; // 避免null
+        userArray.push_back(userJson);
+    }
+    j["users"] = userArray;
     return j.dump();
 }
 
@@ -101,34 +180,22 @@ std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users) {
 // 重构：处理用户列表请求（保证响应格式与登录响应一致）
 void handleUserListReq(int clientFd, const std::string& clientIp) {
     std::cout << "【用户列表请求】客户端IP：" << clientIp << "，FD：" << clientFd << std::endl;
-    (void)clientIp;
     UserListRsp rsp;
     
-    // 1. 仅读取全局在线用户时加锁
+    // 1. 读取在线用户
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         for (const auto& [id, user] : g_onlineUsers) {
             rsp.users.push_back(user);
+            std::cout << "在线用户：ID=" << id << "，昵称=" << user.nickname << std::endl;
         }
     }
 
-    // 2. 序列化用户列表响应（与登录响应格式统一）
-    nlohmann::json j;
-    j["userCount"] = rsp.users.size(); // 客户端可先读数量，再读列表
-    nlohmann::json userArray = nlohmann::json::array();
-    for (const auto& user : rsp.users) {
-        nlohmann::json userJson;
-        userJson["userId"] = user.userId;
-        userJson["nickname"] = user.nickname;
-        userJson["isOnline"] = user.isOnline;
-        userJson["ip"] = user.ip;
-        userJson["dataPort"] = user.dataPort;
-        userArray.push_back(userJson);
-    }
-    j["users"] = userArray;
-    std::string rspJson = j.dump();
+    // 2. 统一序列化（使用protocol.h的工具函数）
+    std::string rspJson = serialize(rsp);
+    std::cout << "用户列表响应JSON：" << rspJson << std::endl;
 
-    // 3. 构造响应头部（正确转换字节序）
+    // 3. 构造响应头部
     PacketHeader rspHeader;
     rspHeader.msgType = static_cast<uint32_t>(MsgType::USER_LIST_RSP);
     rspHeader.dataLen = rspJson.size();
@@ -136,11 +203,15 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
     rspHeader.senderId = 0;
     PacketHeader netRspHeader = htonHeader(rspHeader);
 
-    // 4. 发送响应（加MSG_NOSIGNAL，检查返回值）
+    // 4. 发送响应（检查错误）
     ssize_t headerSend = send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
     ssize_t dataSend = send(clientFd, rspJson.c_str(), rspJson.size(), MSG_NOSIGNAL);
-    std::cout << "用户列表响应发送完成：header=" << headerSend << ", data=" << dataSend << std::endl;
-    std::cout << "【用户列表响应】发送成功，在线用户数：" << rsp.users.size() << std::endl;
+    
+    if (headerSend < 0 || dataSend < 0) {
+        std::cout << "用户列表响应发送失败：header=" << headerSend << ", data=" << dataSend << "，错误：" << strerror(errno) << std::endl;
+    } else {
+        std::cout << "用户列表响应发送完成：header=" << headerSend << ", data=" << dataSend << "，在线用户数：" << rsp.users.size() << std::endl;
+    }
 }
 
 // 广播函数（仅在读取全局g_fdToUserId时加锁）
@@ -163,10 +234,28 @@ void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
 
     // 遍历+发送（无需锁，用局部拷贝的fdCopy）
     for (const auto& [clientFd, userId] : fdCopy) {
-        if (clientFd == excludeFd) continue;
-        // 加MSG_NOSIGNAL避免SIGPIPE崩溃
-        send(clientFd, &header, sizeof(PacketHeader), MSG_NOSIGNAL);
-        send(clientFd, data.c_str(), data.size(), MSG_NOSIGNAL);
+        if (clientFd == excludeFd) {
+            std::cout << "跳过排除的FD=" << clientFd << std::endl;
+            continue;
+        }
+        // 设置FD为非阻塞，避免send卡住
+        int flags = fcntl(clientFd, F_GETFL, 0);
+        fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
+
+        // 发送头部（非阻塞）
+        ssize_t headerSend = send(clientFd, &header, sizeof(PacketHeader), MSG_NOSIGNAL | MSG_DONTWAIT);
+        // 发送数据（非阻塞）
+        ssize_t dataSend = send(clientFd, data.c_str(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+
+        // 恢复FD为阻塞（不影响后续正常通信）
+        fcntl(clientFd, F_SETFL, flags);
+
+        // 日志优化
+        if (headerSend == sizeof(PacketHeader) && dataSend == (ssize_t)data.size()) {
+            std::cout << "广播成功：FD=" << clientFd << "，发送字节数：header=" << headerSend << "，data=" << dataSend << std::endl;
+        } else {
+            std::cout << "广播失败/部分发送：FD=" << clientFd << "，header=" << headerSend << "，data=" << dataSend << "，错误：" << (errno ? strerror(errno) : "无") << std::endl;
+        }
     }
     std::cout << "broadcast end" << std::endl;
 }
@@ -174,13 +263,18 @@ void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
 // 处理客户端连接（核心优化：锁仅包裹全局数据操作）
 bool handleClient(int clientFd, const std::string& clientIp) {
     (void)clientIp;
-    
+    // 初始化心跳时间
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
+    }
+
     while (true) {
         PacketHeader netHeader;
         ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader), 0);
         
         if (headerLen <= 0) {
-            std::cout << "客户端断开连接或接收失败" << std::endl;
+            std::cout << "客户端FD=" << clientFd << " 断开连接或接收失败" << std::endl;
             // 【缩小锁范围】仅清理全局数据时加锁
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -193,14 +287,14 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         notify.userId = offlineUserId;
                         notify.nickname = userIt->second.nickname;
                         notify.isOnline = false;
-                        nlohmann::json notifyJson = notify;
-                        std::string notifyData = notifyJson.dump();
+                        std::string notifyData = serialize(notify);
                         // broadcast内部已做局部拷贝，无需锁
                         broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
                         g_onlineUsers.erase(userIt);
                     }
                     g_fdToUserId.erase(fdIt);
                 }
+                g_fdLastHeartbeat.erase(clientFd); // 清理心跳记录
             } // 立即解锁
             return false;
         }
@@ -239,13 +333,27 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 LoginRsp rsp;
                 bool nicknameExists = false;
                 int newUserId = -1;
-                std::string newNickname;
+                std::string newNickname = req.nickname;
                 
                 // 2. 加锁操作全局数据（补充ip/dataPort）
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
+                    // 移除心跳超时但未清理的僵尸用户
+                    auto now = std::chrono::steady_clock::now();
+                    for (auto it = g_onlineUsers.begin(); it != g_onlineUsers.end();) {
+                        int uid = it->first;
+                        int fd = findFdByUserId(uid);
+                        if (fd == -1) { // 无对应FD，判定为僵尸用户
+                            std::cout << "清理僵尸用户：ID=" << uid << "，昵称=" << it->second.nickname << std::endl;
+                            it = g_onlineUsers.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    
+                    // 重新判定昵称（仅检查有效在线用户
                     for (const auto& [id, user] : g_onlineUsers) {
-                        if (user.nickname == req.nickname) {
+                        if (user.nickname == req.nickname && user.isOnline) {
                             nicknameExists = true;
                             break;
                         }
@@ -261,6 +369,8 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         newUser.dataPort = clientDataPort; // 填充dataPort
                         g_onlineUsers[newUserId] = newUser;
                         g_fdToUserId[clientFd] = newUserId;
+                        // 初始化心跳时间
+                        g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
                     }
                 }
 
@@ -283,8 +393,7 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                     notify.userId = newUserId;
                     notify.nickname = newNickname;
                     notify.isOnline = true;
-                    nlohmann::json notifyJson = notify;
-                    std::string notifyData = notifyJson.dump();
+                    std::string notifyData = serialize(notify);
                     // broadcast内部已做局部拷贝，无需锁
                     broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
                     std::cout << "5..." << std::endl;
@@ -316,7 +425,12 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             }
             case MsgType::HEARTBEAT: { // 新增：处理心跳包
                 std::cout << "收到心跳包（MsgType::HEARTBEAT），保持连接" << std::endl;
-                // 可选：回复心跳响应（若客户端需要）
+                // 更新心跳时间
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
+                }
+                // 回复心跳响应
                 PacketHeader rspHeader;
                 rspHeader.msgType = htonl(static_cast<uint32_t>(MsgType::HEARTBEAT));
                 rspHeader.dataLen = htonl(0);
@@ -435,6 +549,41 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 }
                 break;
             }
+            // 新增：处理客户端主动下线通知
+            case MsgType::USER_STATUS_NOTIFY: {
+                std::cout << "收到客户端主动下线通知（FD=" << clientFd << "）" << std::endl;
+                
+                // 1. 先解析通知（解锁状态下）
+                UserStatusNotify notify;
+                try {
+                    notify = deserialize<UserStatusNotify>(std::string(dataBuffer.begin(), dataBuffer.end()));
+                    std::cout << "主动下线用户：ID=" << notify.userId << "，昵称=" << notify.nickname << std::endl;
+                } catch (...) {
+                    std::cout << "解析主动下线通知失败" << std::endl;
+                    break;
+                }
+
+                // 2. 加锁仅处理必要操作，移除sleep
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    // 先广播（非阻塞）
+                    std::string notifyData = serialize(notify);
+                    std::cout << "开始广播主动下线通知：" << notifyData << std::endl;
+                    broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                    
+                    // 清理数据（精简）
+                    g_fdToUserId.erase(clientFd);
+                    g_onlineUsers.erase(notify.userId);
+                    g_fdLastHeartbeat.erase(clientFd);
+                } // 立即解锁，避免阻塞
+
+                // 3. 关闭FD（非阻塞）
+                shutdown(clientFd, SHUT_RDWR);
+                close(clientFd);
+                
+                std::cout << "主动下线用户处理完成：ID=" << notify.userId << std::endl;
+                return false;
+            }
             default:
                 std::cout << "未知消息类型: " << (int)msgType << std::endl;
                 break;
@@ -477,7 +626,13 @@ int main() {
         close(serverFd);
         return -1;
     }
-    
+ 
+    // 启动心跳检测线程
+    g_isRunning = true;
+    g_heartbeatCheckThread = std::thread(heartbeatCheckThread);
+    g_heartbeatCheckThread.detach();
+    std::cout << "心跳检测线程已启动，超时阈值：" << HEARTBEAT_TIMEOUT_SEC << "秒" << std::endl;
+
     std::cout << "服务器启动，监听端口 8888...（多线程版本）" << std::endl;
     
     while (true) {
@@ -495,6 +650,12 @@ int main() {
         
         std::thread t(handleClientThread, clientFd, clientIp);
         t.detach();
+    }
+
+    // 退出时停止心跳线程
+    g_isRunning = false;
+    if (g_heartbeatCheckThread.joinable()) {
+        g_heartbeatCheckThread.join();
     }
     
     close(serverFd);

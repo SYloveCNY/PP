@@ -17,12 +17,17 @@
 LoginWindow::LoginWindow(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::LoginWindow),  // 初始化UI成员
-    m_serverSocket(new QTcpSocket(this))  // 初始化socket
+    m_serverSocket(nullptr) // 初始化为null，每次登录创建新Socket
 {
     ui->setupUi(this);  // 初始化UI
 }
 
 LoginWindow::~LoginWindow() {
+    // 析构时彻底关闭Socket
+    if (m_serverSocket) {
+        m_serverSocket->disconnectFromHost();
+        m_serverSocket->deleteLater();
+    }
     delete ui;  // 释放UI资源
 }
 
@@ -54,8 +59,6 @@ uint16_t LoginWindow::getRandomAvailablePort() {
 void LoginWindow::on_pushButton_login_clicked() {
     QString nickname = ui->lineEdit_nickname->text().trimmed();
     QString avatarPath = ui->lineEdit_avatar->text().trimmed();
-    // uint16_t dataPort = 9999;  // 固定数据端口（测试用）
-    // 生成随机可用端口（替换固定的9999）
     uint16_t dataPort = getRandomAvailablePort();
 
     if (nickname.isEmpty()) {
@@ -63,63 +66,99 @@ void LoginWindow::on_pushButton_login_clicked() {
         return;
     }
 
-    // 连接服务端（IP：127.0.0.1，端口：8888）
+    // ========== 终极修复：完全重置Socket，避免任何旧连接残留 ==========
+    if (m_serverSocket) {
+        m_serverSocket->abort(); // 强制关闭，不等待
+        m_serverSocket->deleteLater();
+        m_serverSocket = nullptr;
+    }
+    m_serverSocket = new QTcpSocket(this);
+
+    // 连接服务端（增加错误处理）
+    connect(m_serverSocket, &QTcpSocket::errorOccurred, this, [=](QAbstractSocket::SocketError error) {
+        QMessageBox::critical(this, "Socket错误", "连接/通信失败：" + m_serverSocket->errorString());
+    });
+
     m_serverSocket->connectToHost("127.0.0.1", 8888);
-    if (!m_serverSocket->waitForConnected(3000)) {
-        QMessageBox::critical(this, "错误", "连接服务端失败！");
+    if (!m_serverSocket->waitForConnected(5000)) {
+        QMessageBox::critical(this, "错误", "连接服务端失败！请检查服务端是否启动");
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
         return;
     }
 
-    // 构造登录请求JSON
+    // 构造登录请求（简化，确保字段正确）
     QJsonObject loginObj;
     loginObj["nickname"] = nickname;
-    loginObj["avatar"] = avatarPath;
-    loginObj["dataPort"] = dataPort;
+    loginObj["dataPort"] = dataPort; // 仅保留必要字段
     QJsonDocument doc(loginObj);
     QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
 
-    // 发送登录请求（使用 protocol_qt.h 中的 sendPacket 函数）
+    // 发送登录请求（增加发送结果检查）
     if (!sendPacket(m_serverSocket, static_cast<uint32_t>(MsgType::LOGIN_REQ), jsonData)) {
         QMessageBox::critical(this, "错误", "发送登录请求失败！");
-        m_serverSocket->disconnectFromHost();
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
         return;
     }
 
-    // 等待登录响应
-    if (!m_serverSocket->waitForReadyRead(3000)) {
-        QMessageBox::critical(this, "错误", "接收登录响应超时！");
-        m_serverSocket->disconnectFromHost();
+    // 等待响应（增加超时日志）
+    if (!m_serverSocket->waitForReadyRead(5000)) {
+        QMessageBox::critical(this, "错误", "接收登录响应超时！\n可能原因：\n1. 服务端未处理请求\n2. 网络阻塞\n3. 昵称已被占用（服务端未返回响应）");
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
         return;
     }
 
-    // 读取并解析登录响应（直接调用 qFromBigEndian）
+    // 解析响应（增加容错）
     PacketHeader netRspHeader;
-    m_serverSocket->read((char*)&netRspHeader, sizeof(PacketHeader));
+    qint64 headerRead = m_serverSocket->read((char*)&netRspHeader, sizeof(PacketHeader));
+    if (headerRead != sizeof(PacketHeader)) {
+        QMessageBox::critical(this, "错误", QString("读取响应头部失败！期望%1字节，实际%2字节").arg(sizeof(PacketHeader)).arg(headerRead));
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
+        return;
+    }
+
     PacketHeader hostRspHeader;
-    hostRspHeader.msgType = qFromBigEndian(netRspHeader.msgType);  // 无需 Qt:: 前缀
+    hostRspHeader.msgType = qFromBigEndian(netRspHeader.msgType);
     hostRspHeader.dataLen = qFromBigEndian(netRspHeader.dataLen);
 
     if (static_cast<MsgType>(hostRspHeader.msgType) != MsgType::LOGIN_RSP) {
-        QMessageBox::critical(this, "错误", "收到无效响应！");
-        m_serverSocket->disconnectFromHost();
+        QMessageBox::critical(this, "错误", QString("收到无效响应类型！期望%1，实际%2").arg(static_cast<int>(MsgType::LOGIN_RSP)).arg(hostRspHeader.msgType));
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
         return;
     }
 
     QByteArray rspJsonData = m_serverSocket->read(hostRspHeader.dataLen);
     QJsonDocument rspDoc = QJsonDocument::fromJson(rspJsonData);
+    if (!rspDoc.isObject()) {
+        QMessageBox::critical(this, "错误", "解析登录响应失败！响应数据：" + QString(rspJsonData));
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
+        return;
+    }
+
     QJsonObject rspObj = rspDoc.object();
     bool success = rspObj["success"].toBool();
     QString msg = rspObj["msg"].toString();
     int userId = rspObj["userId"].toInt();
 
     if (success) {
-        // 登录成功，打开聊天窗口
         ChatWindow* chatWindow = new ChatWindow;
         chatWindow->setLoginInfo(userId, nickname, m_serverSocket);
         chatWindow->show();
-        this->hide();  // 隐藏登录窗口
+        this->hide();
     } else {
         QMessageBox::warning(this, "登录失败", msg);
-        m_serverSocket->disconnectFromHost();
+        m_serverSocket->abort();
+        delete m_serverSocket;
+        m_serverSocket = nullptr;
     }
 }

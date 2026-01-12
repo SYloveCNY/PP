@@ -11,6 +11,10 @@
 #include <QJsonDocument>
 #include <QFile>
 #include <QByteArray>
+#include <QCloseEvent>
+#include <thread>
+#include <QTime>
+#include <iostream>
 #include "../../include/protocol.h"
 #include "../../include/protocol_qt.h"
 
@@ -66,11 +70,58 @@ ChatWindow::ChatWindow(QWidget *parent)
     connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatWindow::sendHeartbeat);
     
     // 启动心跳定时器
-    m_heartbeatTimer->start(30000);
+    m_heartbeatTimer->start(10000);
 }
 
 ChatWindow::~ChatWindow() {
     delete ui; // 释放UI对象
+}
+
+// 新增：主动关闭窗口时发送下线通知
+void ChatWindow::closeEvent(QCloseEvent *event) {
+    if (m_socket && m_socket->state() == QTcpSocket::ConnectedState) {
+        // 停止心跳定时器，避免干扰
+        m_heartbeatTimer->stop();
+        // 禁用Socket的延迟发送，强制立即发送
+        m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+
+        // 构造主动下线通知
+        UserStatusNotify notify;
+        notify.userId = m_userId;
+        notify.nickname = m_nickname.toStdString();
+        notify.isOnline = false;
+        std::string notifyData = serialize(notify);
+        
+        // 发送主动下线消息（强制发送）
+        bool sendOk = sendPacket(m_socket, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), notifyData, nextMsgId++, m_userId);
+        if (sendOk) {
+            std::cout << "主动下线通知发送成功：ID=" << m_userId << "，数据：" << notifyData << std::endl;
+            // 延长等待时间到1秒，确保数据发送完成
+            if (m_socket->waitForBytesWritten(1000)) {
+                std::cout << "主动下线通知已写入Socket缓冲区" << std::endl;
+            } else {
+                std::cout << "主动下线通知写入缓冲区超时" << std::endl;
+            }
+        } else {
+            std::cout << "主动下线通知发送失败，Socket状态：" << m_socket->state() << std::endl;
+        }
+        
+        // 断开连接
+        m_socket->disconnectFromHost();
+        if (m_socket->state() != QTcpSocket::UnconnectedState) {
+            m_socket->waitForDisconnected(1000);
+        }
+
+        // 清理全局变量
+        g_currentUserId = 0;
+        g_clientSocket = nullptr;
+    }
+
+    // 重置成员变量
+    m_userId = 0;
+    m_nickname.clear();
+    m_socket = nullptr;
+    event->accept();
 }
 
 // 设置登录信息
@@ -100,115 +151,125 @@ void ChatWindow::onServerReadyRead() {
     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
     if (!socket) return;
 
-    // 读取头部
-    QByteArray headerData = socket->read(sizeof(PacketHeader));
-    if (headerData.size() != sizeof(PacketHeader)) return;
+    // 循环读取所有可用数据（处理粘包/半包）
+    while (socket->bytesAvailable() >= sizeof(PacketHeader)) {
+        // 读取头部
+        QByteArray headerData = socket->peek(sizeof(PacketHeader));
+        if (headerData.size() != sizeof(PacketHeader)) break;
 
-    PacketHeader* netHeader = reinterpret_cast<PacketHeader*>(headerData.data());
-    PacketHeader hostHeader = ntohHeader(*netHeader);
+        PacketHeader* netHeader = reinterpret_cast<PacketHeader*>(headerData.data());
+        PacketHeader hostHeader = ntohHeader(*netHeader);
 
-    // 读取数据
-    QByteArray data = socket->read(hostHeader.dataLen);
-    std::string dataStr = data.toStdString();
+        // 检查数据是否完整
+            qint64 totalLen = sizeof(PacketHeader) + hostHeader.dataLen;
+            if (socket->bytesAvailable() < totalLen) break;
 
-    // 处理不同类型的消息
-    MsgType msgType = static_cast<MsgType>(hostHeader.msgType);
-    switch (msgType) {
-        // ========== 新增：处理上下线通知 ==========
-        case MsgType::USER_STATUS_NOTIFY: {
-            // 反序列化通知
-            nlohmann::json notifyJson = nlohmann::json::parse(dataStr);
-            UserStatusNotify notify = notifyJson.get<UserStatusNotify>();
-            
-            // 显示系统通知
-            QString notifyText = QString("%1（ID：%2）%3")
-                .arg(QString::fromStdString(notify.nickname))
-                .arg(notify.userId)
-                .arg(notify.isOnline ? "上线了" : "下线了");
-            
-            // 调用你现有的showMessage函数显示通知
-            showMessage("系统通知", notifyText);
-            
-            // 可选：更新用户列表（如果需要）
-            // updateUserList(); 
-            break;
-        }
-        case MsgType::USER_LIST_RSP: { // 修复解析逻辑
-            try {
-                nlohmann::json rspJson = nlohmann::json::parse(dataStr);
-                int userCount = rspJson["userCount"];
-                auto usersJson = rspJson["users"];
+        // 完整读取头部+数据
+        socket->read(sizeof(PacketHeader)); // 移除头部数据
+        QByteArray data = socket->read(hostHeader.dataLen);
+        std::string dataStr = data.toStdString();
 
-                // 手动解析用户列表（对齐服务器返回结构）
-                std::vector<UserInfo> users;
-                for (auto& userJson : usersJson) {
-                    UserInfo user;
-                    user.userId = userJson["userId"];
-                    user.nickname = userJson["nickname"];
-                    user.isOnline = userJson["isOnline"];
-                    user.ip = userJson.contains("ip") ? userJson["ip"].get<std::string>() : "";
-                    user.dataPort = userJson.contains("dataPort") ? userJson["dataPort"].get<int>() : 0;
-                    users.push_back(user);
+        // 处理不同类型的消息
+        MsgType msgType = static_cast<MsgType>(hostHeader.msgType);
+        switch (msgType) {
+            case MsgType::USER_STATUS_NOTIFY: {
+                try {
+                    UserStatusNotify notify = deserialize<UserStatusNotify>(dataStr);
+                    QString statusText = notify.isOnline ? "上线了" : "下线了（主动/意外退出）";
+                    QString notifyText = QString("%1（ID：%2）%3")
+                        .arg(QString::fromStdString(notify.nickname))
+                        .arg(notify.userId)
+                        .arg(statusText);
+                    showMessage("系统通知", notifyText);
+                } catch (std::exception& e) {
+                    showMessage("解析错误", QString("解析状态通知失败：%1").arg(e.what()));
                 }
+                break;
+            }
+            case MsgType::USER_LIST_RSP: {
+                try {
+                    nlohmann::json rspJson = nlohmann::json::parse(dataStr);
+                    // 【修复4】增加字段存在性检查，避免null错误
+                    int userCount = rspJson.contains("userCount") ? rspJson["userCount"].get<int>() : 0;
+                    auto usersJson = rspJson.contains("users") ? rspJson["users"] : nlohmann::json::array();
 
-                // 更新UI显示
-                updateUserList(users);
-            } catch (std::exception& e) {
-                showMessage("解析错误", QString("解析用户列表失败：%1").arg(e.what()));
+                    std::vector<UserInfo> users;
+                    for (auto& userJson : usersJson) {
+                        UserInfo user;
+                        // 逐个字段检查，避免null转int失败
+                        user.userId = userJson.contains("userId") && !userJson["userId"].is_null() ? userJson["userId"].get<int>() : 0;
+                        user.nickname = userJson.contains("nickname") && !userJson["nickname"].is_null() ? userJson["nickname"].get<std::string>() : "";
+                        user.isOnline = userJson.contains("isOnline") && !userJson["isOnline"].is_null() ? userJson["isOnline"].get<bool>() : false;
+                        user.ip = userJson.contains("ip") && !userJson["ip"].is_null() ? userJson["ip"].get<std::string>() : "";
+                        user.dataPort = userJson.contains("dataPort") && !userJson["dataPort"].is_null() ? userJson["dataPort"].get<int>() : 0;
+                        if (user.userId > 0) { // 过滤无效用户
+                            users.push_back(user);
+                        }
+                    }
+
+                    updateUserList(users);
+                    qDebug() << "用户列表解析成功，共" << users.size() << "个用户";
+                } catch (std::exception& e) {
+                    showMessage("解析错误", QString("解析用户列表失败：%1，原始数据：%2").arg(e.what()).arg(QString::fromStdString(dataStr)));
+                }
+                break;
             }
-            break;
-        }
-        case MsgType::PRIVATE_MSG: {
-            try {
-                nlohmann::json msgJson = nlohmann::json::parse(dataStr);
-                std::string senderNickname = msgJson["senderNickname"];
-                std::string content = msgJson["content"];
-                // 显示私聊消息，标记为私聊
-                showMessage(QString::fromStdString(senderNickname) + "(私聊)", QString::fromStdString(content), true);
-            } catch (std::exception& e) {
-                showMessage("未知用户", QString::fromStdString(dataStr));
+            case MsgType::PRIVATE_MSG: {
+                try {
+                    nlohmann::json msgJson = nlohmann::json::parse(dataStr);
+                    std::string senderNickname = msgJson["senderNickname"];
+                    std::string content = msgJson["content"];
+                    // 显示私聊消息，标记为私聊
+                    showMessage(QString::fromStdString(senderNickname) + "(私聊)", QString::fromStdString(content), true);
+                } catch (std::exception& e) {
+                    showMessage("未知用户", QString::fromStdString(dataStr));
+                }
+                break;
             }
-            break;
-        }
-        case MsgType::PRIVATE_MSG_RSP: {
-            try {
-                nlohmann::json rspJson = nlohmann::json::parse(dataStr);
-                bool success = rspJson["success"];
-                std::string msg = rspJson["msg"];
-                showMessage("系统提示", QString::fromStdString(msg));
-            } catch (std::exception& e) {
-                showMessage("系统提示", "私聊响应解析失败");
+            case MsgType::PRIVATE_MSG_RSP: {
+                try {
+                    nlohmann::json rspJson = nlohmann::json::parse(dataStr);
+                    bool success = rspJson["success"];
+                    std::string msg = rspJson["msg"];
+                    showMessage("系统提示", QString::fromStdString(msg));
+                } catch (std::exception& e) {
+                    showMessage("系统提示", "私聊响应解析失败");
+                }
+                break;
             }
-            break;
-        }
-        case MsgType::COMMON_MSG: {
-            try {
-                // 解析服务端转发的JSON消息
-                nlohmann::json msgJson = nlohmann::json::parse(dataStr);
-                std::string senderNickname = msgJson["senderNickname"];
-                std::string content = msgJson["content"];
-                
-                // 显示真实发送方的消息（而非“服务器”）
-                showMessage(QString::fromStdString(senderNickname), QString::fromStdString(content));
-            } catch (std::exception& e) {
-                // 兼容旧逻辑：解析失败则显示原始内容
-                showMessage("未知用户", QString::fromStdString(dataStr));
+            case MsgType::COMMON_MSG: {
+                try {
+                    // 解析服务端转发的JSON消息
+                    nlohmann::json msgJson = nlohmann::json::parse(dataStr);
+                    std::string senderNickname = msgJson["senderNickname"];
+                    std::string content = msgJson["content"];
+                    
+                    // 显示真实发送方的消息（而非“服务器”）
+                    showMessage(QString::fromStdString(senderNickname), QString::fromStdString(content));
+                } catch (std::exception& e) {
+                    // 兼容旧逻辑：解析失败则显示原始内容
+                    showMessage("未知用户", QString::fromStdString(dataStr));
+                }
+                break;
             }
-            break;
+            case MsgType::HEARTBEAT: { // 新增：处理服务器返回的心跳响应
+                showMessage("系统提示", "心跳包响应正常");
+                break;
+            }
+            default:
+                showMessage("未知消息", QString("收到未知消息类型：%1").arg((int)msgType));
+                break;
         }
-        case MsgType::HEARTBEAT: { // 新增：处理服务器返回的心跳响应
-            showMessage("系统提示", "心跳包响应正常");
-            break;
-        }
-        default:
-            showMessage("未知消息", QString("收到未知消息类型：%1").arg((int)msgType));
-            break;
     }
 }
 
 // 更新用户列表（简化实现）
 void ChatWindow::updateUserList(const std::vector<UserInfo>& users) {
-    // 清空在线用户列表控件
+    // 清空列表前先确认控件有效
+    if (!ui->listWidget_onlineUsers) {
+        showMessage("系统提示", "在线用户列表控件未初始化！");
+        return;
+    }
     ui->listWidget_onlineUsers->clear();
     
     // 遍历添加用户到列表
