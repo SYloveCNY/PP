@@ -24,9 +24,11 @@ protected:
 private slots:
     // 声明登录按钮的槽函数（与UI文件中的按钮名称对应）
     void on_pushButton_login_clicked();
-    // 接收服务端消息（新增）
+    // 处理登录响应的readyRead
+    void onLoginResponseReadyRead();
+    // 接收服务端消息
     void onReadyRead();
-    // 发送心跳包（新增）
+    // 发送心跳包
     void sendHeartbeat();
 
 private:

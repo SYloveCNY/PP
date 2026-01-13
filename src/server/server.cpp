@@ -26,10 +26,13 @@ std::thread g_heartbeatCheckThread;
 bool g_isRunning = true;
 
 // 函数声明
-void broadcast(const std::string& data, uint32_t msgType, int excludeFd = -1);
+void broadcast(const std::string& data, uint32_t msgType, int excludeFd = -1); // 对外接口（带默认参数）
+void broadcast(const std::string& data, uint32_t msgType, int excludeFd, const std::map<int, int>& fdCopy); // 内部重载函数
 void heartbeatCheckThread();
 void handleClientThread(int clientFd, const std::string& clientIp);
 int findFdByUserId(int userId);
+// 优化：返回FD-UID映射的拷贝，避免多次加锁
+std::map<int, int> getFdToUserIdCopy();
 std::string serializePrivateMsg(const PrivateMsg& msg);
 std::string serializePrivateMsgRsp(const PrivateMsgRsp& rsp);
 LoginReq deserializeLoginReq(const std::string& jsonStr);
@@ -39,6 +42,8 @@ std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users);
 void handleUserListReq(int clientFd, const std::string& clientIp);
 bool handleClient(int clientFd, const std::string& clientIp);
 bool isFdValid(int fd);
+// 优化：僵尸用户清理移到锁外
+void cleanZombieUsers();
 
 // 检查FD是否有效（核心：判断旧FD是否真的失效）
 bool isFdValid(int fd) {
@@ -50,15 +55,49 @@ bool isFdValid(int fd) {
     return err == 0;
 }
 
-// 根据用户ID查找对应的客户端FD（加锁读取）
-int findFdByUserId(int userId) {
+// 优化：一次性拷贝FD-UID映射，避免多次加锁
+std::map<int, int> getFdToUserIdCopy() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    for (const auto& [fd, uid] : g_fdToUserId) {
+    return g_fdToUserId;
+}
+
+// 优化：根据UID找FD（使用拷贝的映射，避免锁内循环调用）
+int findFdByUserId(int userId) {
+    auto fdCopy = getFdToUserIdCopy();
+    for (const auto& [fd, uid] : fdCopy) {
         if (uid == userId) {
             return fd;
         }
     }
     return -1; // 用户不在线
+}
+
+// 优化：僵尸用户清理（锁外遍历，批量删除）
+void cleanZombieUsers() {
+    auto fdCopy = getFdToUserIdCopy();
+    std::vector<int> invalidFds;
+    
+    // 1. 锁外检查FD有效性
+    for (const auto& [fd, uid] : fdCopy) {
+        if (!isFdValid(fd)) {
+            invalidFds.push_back(fd);
+        }
+    }
+    
+    // 2. 批量加锁删除无效FD和用户
+    if (!invalidFds.empty()) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (int fd : invalidFds) {
+            auto uidIt = g_fdToUserId.find(fd);
+            if (uidIt != g_fdToUserId.end()) {
+                int uid = uidIt->second;
+                g_onlineUsers.erase(uid);
+                g_fdToUserId.erase(uidIt);
+                g_fdLastHeartbeat.erase(fd);
+                std::cout << "清理僵尸用户：FD=" << fd << "，UID=" << uid << std::endl;
+            }
+        }
+    }
 }
 
 // 序列化私聊消息
@@ -84,10 +123,14 @@ std::string serializePrivateMsgRsp(const PrivateMsgRsp& rsp) {
 void heartbeatCheckThread() {
     while (g_isRunning) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
+        cleanZombieUsers(); // 复用清理逻辑
+        
         std::lock_guard<std::mutex> lock(g_mutex);
         
         // 先收集超时FD，避免遍历中修改map
         std::vector<int> timeoutFds;
+        auto now = std::chrono::steady_clock::now();
+        
         for (const auto& [fd, lastTime] : g_fdLastHeartbeat) {
             auto now = std::chrono::steady_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
@@ -114,9 +157,8 @@ void heartbeatCheckThread() {
                     notify.userId = offlineUserId;
                     notify.nickname = offlineNickname;
                     notify.isOnline = false;
-                    std::string notifyData = serialize(notify);
+                    std::string notifyData = nlohmann::json(notify).dump(); // 修复序列化
                     broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
-                    
                     g_onlineUsers.erase(userIt);
                     std::cout << "清理离线用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
                 }
@@ -188,8 +230,7 @@ std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users) {
     return std::vector<char>(jsonStr.begin(), jsonStr.end());
 }
 
-// 处理用户列表请求（仅在读取全局数据时加锁）
-// 重构：处理用户列表请求（保证响应格式与登录响应一致）
+// 处理用户列表请求
 void handleUserListReq(int clientFd, const std::string& clientIp) {
     std::cout << "【用户列表请求】客户端IP：" << clientIp << "，FD：" << clientFd << std::endl;
     UserListRsp rsp;
@@ -204,7 +245,7 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
     }
 
     // 2. 统一序列化（使用protocol.h的工具函数）
-    std::string rspJson = serialize(rsp);
+    std::string rspJson = serializeUserListRsp(rsp);
     std::cout << "用户列表响应JSON：" << rspJson << std::endl;
 
     // 3. 构造响应头部
@@ -226,66 +267,65 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
     }
 }
 
-// 广播函数（仅在读取全局g_fdToUserId时加锁）
-void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
+// 广播函数：仅接收已拷贝的FD映射，不在内部加锁
+void broadcast(const std::string& data, uint32_t msgType, int excludeFd, const std::map<int, int>& fdCopy) {
     std::cout << "broadcast begin" << std::endl;
     
-    std::map<int, int> fdCopy;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        fdCopy = g_fdToUserId; // 仅拷贝全局数据，立即解锁
-    }
-    
-    // 构造头部（无需锁）
-    PacketHeader header;
-    header.msgType = htonl(msgType);
-    header.dataLen = htonl(data.size());
-    header.msgId = htonl(0);
-    header.senderId = htonl(0);
+    // 构造主机字节序头部，再转换为网络字节序（符合协议规范）
+    PacketHeader hostHeader;
+    hostHeader.msgType = msgType;
+    hostHeader.dataLen = data.size();
+    hostHeader.msgId = 0;
+    hostHeader.senderId = 0;
+    PacketHeader netHeader = htonHeader(hostHeader); // 使用封装的转换函数
 
-    // 遍历+发送（无需锁，用局部拷贝的fdCopy）
+    // 遍历FD发送（无锁）
     for (const auto& [clientFd, userId] : fdCopy) {
         if (clientFd == excludeFd) {
             std::cout << "跳过排除的FD=" << clientFd << std::endl;
             continue;
         }
 
-        // 新增：先检查FD是否有效，避免fcntl操作无效FD
         if (!isFdValid(clientFd)) {
             std::cout << "FD=" << clientFd << " 已失效，跳过广播" << std::endl;
             continue;
         }
 
-        // 设置FD为非阻塞，避免send卡住
-        int flags = fcntl(clientFd, F_GETFL, 0);
-        if (flags == -1) {
-            std::cout << "获取FD=" << clientFd << "属性失败：" << strerror(errno) << std::endl;
-            continue;
-        }
-        if (fcntl(clientFd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            std::cout << "设置FD=" << clientFd << "为非阻塞失败：" << strerror(errno) << std::endl;
-            continue;
-        }
-
-        // 发送头部（非阻塞）
-        ssize_t headerSend = send(clientFd, &header, sizeof(PacketHeader), MSG_NOSIGNAL | MSG_DONTWAIT);
-        // 发送数据（非阻塞）
+        // 非阻塞发送，处理EAGAIN错误
+        ssize_t headerSend = send(clientFd, &netHeader, sizeof(PacketHeader), MSG_NOSIGNAL | MSG_DONTWAIT);
         ssize_t dataSend = send(clientFd, data.c_str(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
 
-        // 恢复FD为阻塞（不影响后续正常通信）
-        fcntl(clientFd, F_SETFL, flags);
-
-        // 日志优化
-        if (headerSend == sizeof(PacketHeader) && dataSend == (ssize_t)data.size()) {
-            std::cout << "广播成功：FD=" << clientFd << "，发送字节数：header=" << headerSend << "，data=" << dataSend << std::endl;
-        } else {
-            std::cout << "广播失败/部分发送：FD=" << clientFd << "，header=" << headerSend << "，data=" << dataSend << "，错误：" << (errno ? strerror(errno) : "无") << std::endl;
+        if (headerSend < 0 || dataSend < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) { // 忽略非阻塞无数据的错误
+                std::cout << "广播失败：FD=" << clientFd << "，错误：" << strerror(errno) << std::endl;
+            }
         }
     }
     std::cout << "broadcast end" << std::endl;
 }
 
-// 处理客户端连接（核心优化：锁仅包裹全局数据操作）
+// 对外暴露的广播接口（先拷贝FD，再调用无锁广播）
+void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
+    auto fdCopy = getFdToUserIdCopy(); // 这里加锁拷贝，仅一次
+    broadcast(data, msgType, excludeFd, fdCopy); // 无锁广播
+}
+
+// ========== 修复：非阻塞接收数据体（重试接收，避免直接断开） ==========
+bool recvAll(int fd, char* buf, size_t len) {
+    size_t totalRecv = 0;
+    while (totalRecv < len) {
+        ssize_t n = recv(fd, buf + totalRecv, len - totalRecv, 0); // 改为阻塞接收
+        if (n < 0) {
+            return false;
+        } else if (n == 0) {
+            return false;
+        }
+        totalRecv += n;
+    }
+    return true;
+}
+
+// 处理客户端连接
 bool handleClient(int clientFd, const std::string& clientIp) {
     (void)clientIp;
     // 初始化心跳时间
@@ -297,41 +337,48 @@ bool handleClient(int clientFd, const std::string& clientIp) {
     while (true) {
         PacketHeader netHeader;
         // 非阻塞recv（MSG_DONTWAIT）
-        ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader),MSG_DONTWAIT);
+        ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader), MSG_DONTWAIT);
         
         // 明确区分正常断开/异常断开/非阻塞无数据
         if (headerLen == 0) {
-            std::cout << "客户端FD=" << clientFd << " 正常断开（主动调用close()）" << std::endl;
+            std::cout << "客户端FD=" << clientFd << " 正常断开" << std::endl;
+            // 清理用户：先锁内读取+清理数据，再锁外广播
+            int offlineUserId = -1;
+            std::string offlineNickname = "";
+            std::string notifyData; // 锁内构造通知数据，锁外广播
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 auto fdIt = g_fdToUserId.find(clientFd);
                 if (fdIt != g_fdToUserId.end()) {
-                    int offlineUserId = fdIt->second;
-                    std::string offlineNickname = "";
-                    
+                    offlineUserId = fdIt->second;
                     auto userIt = g_onlineUsers.find(offlineUserId);
                     if (userIt != g_onlineUsers.end()) {
-                        offlineNickname = userIt->second.nickname; // 先保存昵称
-                        // 广播正常下线通知
+                        offlineNickname = userIt->second.nickname;
+                        std::cout << "准备广播下线通知：UID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
+                        // 构造下线通知（锁内完成，避免重复加锁）
                         UserStatusNotify notify;
                         notify.userId = offlineUserId;
                         notify.nickname = offlineNickname;
                         notify.isOnline = false;
-                        std::string notifyData = serialize(notify);
-                        broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                        notifyData = nlohmann::json(notify).dump();
                         
-                        g_onlineUsers.erase(userIt); // 后删除，避免迭代器失效
+                        // 立即清理用户数据（核心：避免残留导致重复登录）
+                        g_onlineUsers.erase(userIt);
                         std::cout << "清理正常断开用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
                     }
+                    // 清理FD映射和心跳记录
                     g_fdToUserId.erase(fdIt);
+                    g_fdLastHeartbeat.erase(clientFd);
                 }
-                g_fdLastHeartbeat.erase(clientFd);
             }
-            // 关闭FD（仅关闭一次）
-            if (isFdValid(clientFd)) {
-                close(clientFd);
+
+            // 锁外执行广播（关键：避免嵌套加锁死锁）
+            if (!notifyData.empty()) {
+                broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
             }
-            return false; // 退出循环，不再处理
+
+            close(clientFd);
+            return false;
         } else if (headerLen < 0) {
             // 非阻塞无数据（EAGAIN/EWOULDBLOCK）：继续循环
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -340,13 +387,15 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             }
             // 真正的异常断开
             std::cout << "客户端FD=" << clientFd << " 异常断开，错误：" << strerror(errno) << std::endl;
+            int offlineUserId = -1;
+            std::string offlineNickname = "";
+            std::string notifyData;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 auto fdIt = g_fdToUserId.find(clientFd);
                 if (fdIt != g_fdToUserId.end()) {
-                    int offlineUserId = fdIt->second;
-                    std::string offlineNickname = "";
-                    
+                    // 修复：移除重复定义的offlineUserId，避免外部变量未赋值
+                    offlineUserId = fdIt->second;
                     auto userIt = g_onlineUsers.find(offlineUserId);
                     if (userIt != g_onlineUsers.end()) {
                         offlineNickname = userIt->second.nickname;
@@ -354,15 +403,20 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         notify.userId = offlineUserId;
                         notify.nickname = offlineNickname;
                         notify.isOnline = false;
-                        std::string notifyData = serialize(notify);
-                        broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                        notifyData = nlohmann::json(notify).dump();
                         g_onlineUsers.erase(userIt);
                     }
                     g_fdToUserId.erase(fdIt);
-                    std::cout << "清理异常断开用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
+                    g_fdLastHeartbeat.erase(clientFd);
                 }
-                g_fdLastHeartbeat.erase(clientFd); // 清理心跳记录
-            } // 立即解锁
+            }
+
+            // 锁外广播异常下线通知
+            if (!notifyData.empty()) {
+                broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+            }
+
+            close(clientFd);
             return false;
         }
         
@@ -377,9 +431,10 @@ bool handleClient(int clientFd, const std::string& clientIp) {
         std::vector<char> dataBuffer;
         if (dataLen > 0) {
             dataBuffer.resize(dataLen);
-            ssize_t dataRecvLen = recv(clientFd, dataBuffer.data(), dataLen, MSG_DONTWAIT);
-            if (dataRecvLen != dataLen) {
-                std::cout << "数据接收不完整，实际接收：" << dataRecvLen << "，期望：" << dataLen << std::endl;
+            // 重试接收数据体，避免单次接收失败就断开
+            if (!recvAll(clientFd, dataBuffer.data(), dataLen)) {
+                std::cout << "数据接收失败，客户端FD=" << clientFd << std::endl;
+                close(clientFd);
                 return false;
             }
         }
@@ -402,24 +457,13 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 int newUserId = -1;
                 std::string newNickname = req.nickname;
                 
-                // 2. 加锁操作全局数据（补充ip/dataPort）
+                // 1. 锁外清理僵尸用户
+                cleanZombieUsers();
+                
+                // 2. 最小化锁范围：仅检查昵称+添加用户
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    // 移除心跳超时但未清理的僵尸用户
-                    auto now = std::chrono::steady_clock::now();
-                    for (auto it = g_onlineUsers.begin(); it != g_onlineUsers.end();) {
-                        int uid = it->first;
-                        int fd = findFdByUserId(uid);
-                        // 不仅检查FD是否存在，还要检查FD是否有效
-                        if (fd == -1 || !isFdValid(fd)) { 
-                            std::cout << "清理僵尸用户：ID=" << uid << "，昵称=" << it->second.nickname << std::endl;
-                            it = g_onlineUsers.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
-                    
-                    // 重新判定昵称（仅检查有效在线用户
+                    // 检查昵称是否存在
                     for (const auto& [id, user] : g_onlineUsers) {
                         if (user.nickname == req.nickname && user.isOnline) {
                             nicknameExists = true;
@@ -461,8 +505,8 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                     notify.userId = newUserId;
                     notify.nickname = newNickname;
                     notify.isOnline = true;
-                    std::string notifyData = serialize(notify);
-                    // broadcast内部已做局部拷贝，无需锁
+                    std::string notifyData = nlohmann::json(notify).dump();
+                    // 锁外广播上线通知
                     broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
                     std::cout << "5..." << std::endl;
                 }
@@ -491,20 +535,20 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 handleUserListReq(clientFd, clientIp);
                 break;
             }
-            case MsgType::HEARTBEAT: { // 新增：处理心跳包
-                std::cout << "收到心跳包（MsgType::HEARTBEAT），保持连接" << std::endl;
-                // 更新心跳时间
+            case MsgType::HEARTBEAT: {
+                std::cout << "收到心跳包（FD=" << clientFd << "）" << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
                 }
-                // 回复心跳响应
+                // 修复：心跳响应头部构造错误（统一用htonHeader转换）
                 PacketHeader rspHeader;
-                rspHeader.msgType = htonl(static_cast<uint32_t>(MsgType::HEARTBEAT));
-                rspHeader.dataLen = htonl(0);
-                rspHeader.msgId = htonl(0);
-                rspHeader.senderId = htonl(0);
-                send(clientFd, &rspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
+                rspHeader.msgType = static_cast<uint32_t>(MsgType::HEARTBEAT);
+                rspHeader.dataLen = 0;
+                rspHeader.msgId = 0;
+                rspHeader.senderId = 0;
+                PacketHeader netRspHeader = htonHeader(rspHeader);
+                send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
                 break; // 注意：不要return false，仅break即可保持连接
             }
             case MsgType::COMMON_MSG: {
@@ -623,6 +667,7 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 
                 std::string offlineNickname = "";
                 int offlineUserId = -1;
+                std::string notifyData;
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     auto fdIt = g_fdToUserId.find(clientFd);
@@ -631,19 +676,25 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         auto userIt = g_onlineUsers.find(offlineUserId);
                         if (userIt != g_onlineUsers.end()) {
                             offlineNickname = userIt->second.nickname;
-                            // 广播主动下线通知
+                            // 构造下线通知（统一序列化方式）
                             UserStatusNotify notify;
                             notify.userId = offlineUserId;
                             notify.nickname = offlineNickname;
                             notify.isOnline = false;
-                            std::string notifyData = serialize(notify);
-                            broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                            notifyData = nlohmann::json(notify).dump(); // 替换serialize，保持统一
                             
+                            // 立即清理用户
                             g_onlineUsers.erase(userIt);
                         }
+                        // 清理FD映射和心跳记录
                         g_fdToUserId.erase(fdIt);
                         g_fdLastHeartbeat.erase(clientFd);
                     }
+                }
+
+                // 锁外广播主动下线通知（避免死锁）
+                if (!notifyData.empty()) {
+                    broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
                 }
                 
                 shutdown(clientFd, SHUT_RDWR);
