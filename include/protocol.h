@@ -37,7 +37,10 @@ enum class MsgType : uint32_t {
     IMAGE_MSG = 11,         
     FILE_MSG = 12,          
     PRIVATE_MSG = 13,       // 新增：私聊消息
-    PRIVATE_MSG_RSP = 14    // 新增：私聊响应
+    PRIVATE_MSG_RSP = 14,    // 新增：私聊响应
+    LOGOUT_REQ = 15,               // 新增：主动下线请求
+    HEARTBEAT_RESP = 16,           // 新增：心跳响应
+    STATUS_BROADCAST = 17         // 新增：状态广播（上线/下线通知）
 };
 
 // 用户信息结构体（包含ip和dataPort）

@@ -20,7 +20,6 @@ std::map<int, UserInfo> g_onlineUsers;
 int g_nextUserId = 1;
 std::map<int, int> g_fdToUserId; 
 std::mutex g_mutex; // 非递归锁，仅保护全局数据读写
-// 新增：心跳相关
 std::map<int, std::chrono::steady_clock::time_point> g_fdLastHeartbeat;
 const int HEARTBEAT_TIMEOUT_SEC = 15;
 std::thread g_heartbeatCheckThread;
@@ -39,7 +38,17 @@ std::string serializeUserListRsp(const UserListRsp& rsp);
 std::vector<char> serializeUserListJson(const std::map<int, UserInfo>& users);
 void handleUserListReq(int clientFd, const std::string& clientIp);
 bool handleClient(int clientFd, const std::string& clientIp);
+bool isFdValid(int fd);
 
+// 检查FD是否有效（核心：判断旧FD是否真的失效）
+bool isFdValid(int fd) {
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        return false;
+    }
+    return err == 0;
+}
 
 // 根据用户ID查找对应的客户端FD（加锁读取）
 int findFdByUserId(int userId) {
@@ -76,46 +85,49 @@ void heartbeatCheckThread() {
     while (g_isRunning) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (auto it = g_fdLastHeartbeat.begin(); it != g_fdLastHeartbeat.end();) {
-            int clientFd = it->first;
-            auto lastTime = it->second;
+        
+        // 先收集超时FD，避免遍历中修改map
+        std::vector<int> timeoutFds;
+        for (const auto& [fd, lastTime] : g_fdLastHeartbeat) {
             auto now = std::chrono::steady_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
             
             if (duration.count() > HEARTBEAT_TIMEOUT_SEC) {
-                std::cout << "客户端FD=" << clientFd << " 心跳超时，判定为意外退出" << std::endl;
-                int offlineUserId = -1;
-                std::string offlineNickname = "";
-                
-                // 1. 先获取用户信息（避免erase后丢失）
-                auto fdIt = g_fdToUserId.find(clientFd);
-                if (fdIt != g_fdToUserId.end()) {
-                    offlineUserId = fdIt->second;
-                    auto userIt = g_onlineUsers.find(offlineUserId);
-                    if (userIt != g_onlineUsers.end()) {
-                        offlineNickname = userIt->second.nickname;
-                        // 广播下线通知
-                        UserStatusNotify notify;
-                        notify.userId = offlineUserId;
-                        notify.nickname = offlineNickname;
-                        notify.isOnline = false;
-                        std::string notifyData = serialize(notify);
-                        broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
-                        
-                        // 2. 彻底清理用户数据（关键）
-                        g_onlineUsers.erase(userIt); // 删除用户信息
-                        std::cout << "清理离线用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
-                    }
-                    g_fdToUserId.erase(fdIt); // 删除FD映射
-                }
-                
-                // 3. 关闭连接+清理心跳记录
-                close(clientFd);
-                it = g_fdLastHeartbeat.erase(it);
-                std::cout << "心跳超时用户清理完成：FD=" << clientFd << std::endl;
-            } else {
-                ++it;
+                timeoutFds.push_back(fd);
             }
+        }
+        
+        // 批量清理超时FD
+        for (int clientFd : timeoutFds) {
+            std::cout << "客户端FD=" << clientFd << " 心跳超时，判定为意外退出" << std::endl;
+            int offlineUserId = -1;
+            std::string offlineNickname = "";
+            
+            auto fdIt = g_fdToUserId.find(clientFd);
+            if (fdIt != g_fdToUserId.end()) {
+                offlineUserId = fdIt->second;
+                auto userIt = g_onlineUsers.find(offlineUserId);
+                if (userIt != g_onlineUsers.end()) {
+                    offlineNickname = userIt->second.nickname;
+                    // 广播下线通知
+                    UserStatusNotify notify;
+                    notify.userId = offlineUserId;
+                    notify.nickname = offlineNickname;
+                    notify.isOnline = false;
+                    std::string notifyData = serialize(notify);
+                    broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                    
+                    g_onlineUsers.erase(userIt);
+                    std::cout << "清理离线用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
+                }
+                g_fdToUserId.erase(fdIt);
+            }
+            
+            if (isFdValid(clientFd)) {
+                close(clientFd);
+            }
+            g_fdLastHeartbeat.erase(clientFd);
+            std::cout << "心跳超时用户清理完成：FD=" << clientFd << std::endl;
         }
     }
 }
@@ -218,8 +230,7 @@ void handleUserListReq(int clientFd, const std::string& clientIp) {
 void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
     std::cout << "broadcast begin" << std::endl;
     
-    // 【缩小锁范围】仅拷贝全局map时加锁，遍历/发送均解锁
-    std::map<int, int> fdCopy; // 局部拷贝，避免遍历中map被修改
+    std::map<int, int> fdCopy;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         fdCopy = g_fdToUserId; // 仅拷贝全局数据，立即解锁
@@ -238,9 +249,23 @@ void broadcast(const std::string& data, uint32_t msgType, int excludeFd) {
             std::cout << "跳过排除的FD=" << clientFd << std::endl;
             continue;
         }
+
+        // 新增：先检查FD是否有效，避免fcntl操作无效FD
+        if (!isFdValid(clientFd)) {
+            std::cout << "FD=" << clientFd << " 已失效，跳过广播" << std::endl;
+            continue;
+        }
+
         // 设置FD为非阻塞，避免send卡住
         int flags = fcntl(clientFd, F_GETFL, 0);
-        fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
+        if (flags == -1) {
+            std::cout << "获取FD=" << clientFd << "属性失败：" << strerror(errno) << std::endl;
+            continue;
+        }
+        if (fcntl(clientFd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            std::cout << "设置FD=" << clientFd << "为非阻塞失败：" << strerror(errno) << std::endl;
+            continue;
+        }
 
         // 发送头部（非阻塞）
         ssize_t headerSend = send(clientFd, &header, sizeof(PacketHeader), MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -271,28 +296,70 @@ bool handleClient(int clientFd, const std::string& clientIp) {
 
     while (true) {
         PacketHeader netHeader;
-        ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader), 0);
+        // 非阻塞recv（MSG_DONTWAIT）
+        ssize_t headerLen = recv(clientFd, &netHeader, sizeof(PacketHeader),MSG_DONTWAIT);
         
-        if (headerLen <= 0) {
-            std::cout << "客户端FD=" << clientFd << " 断开连接或接收失败" << std::endl;
-            // 【缩小锁范围】仅清理全局数据时加锁
+        // 明确区分正常断开/异常断开/非阻塞无数据
+        if (headerLen == 0) {
+            std::cout << "客户端FD=" << clientFd << " 正常断开（主动调用close()）" << std::endl;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 auto fdIt = g_fdToUserId.find(clientFd);
                 if (fdIt != g_fdToUserId.end()) {
                     int offlineUserId = fdIt->second;
+                    std::string offlineNickname = "";
+                    
                     auto userIt = g_onlineUsers.find(offlineUserId);
                     if (userIt != g_onlineUsers.end()) {
+                        offlineNickname = userIt->second.nickname; // 先保存昵称
+                        // 广播正常下线通知
                         UserStatusNotify notify;
                         notify.userId = offlineUserId;
-                        notify.nickname = userIt->second.nickname;
+                        notify.nickname = offlineNickname;
                         notify.isOnline = false;
                         std::string notifyData = serialize(notify);
-                        // broadcast内部已做局部拷贝，无需锁
+                        broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                        
+                        g_onlineUsers.erase(userIt); // 后删除，避免迭代器失效
+                        std::cout << "清理正常断开用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
+                    }
+                    g_fdToUserId.erase(fdIt);
+                }
+                g_fdLastHeartbeat.erase(clientFd);
+            }
+            // 关闭FD（仅关闭一次）
+            if (isFdValid(clientFd)) {
+                close(clientFd);
+            }
+            return false; // 退出循环，不再处理
+        } else if (headerLen < 0) {
+            // 非阻塞无数据（EAGAIN/EWOULDBLOCK）：继续循环
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 避免空循环占用CPU
+                continue;
+            }
+            // 真正的异常断开
+            std::cout << "客户端FD=" << clientFd << " 异常断开，错误：" << strerror(errno) << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto fdIt = g_fdToUserId.find(clientFd);
+                if (fdIt != g_fdToUserId.end()) {
+                    int offlineUserId = fdIt->second;
+                    std::string offlineNickname = "";
+                    
+                    auto userIt = g_onlineUsers.find(offlineUserId);
+                    if (userIt != g_onlineUsers.end()) {
+                        offlineNickname = userIt->second.nickname;
+                        UserStatusNotify notify;
+                        notify.userId = offlineUserId;
+                        notify.nickname = offlineNickname;
+                        notify.isOnline = false;
+                        std::string notifyData = serialize(notify);
                         broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
                         g_onlineUsers.erase(userIt);
                     }
                     g_fdToUserId.erase(fdIt);
+                    std::cout << "清理异常断开用户：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
                 }
                 g_fdLastHeartbeat.erase(clientFd); // 清理心跳记录
             } // 立即解锁
@@ -310,9 +377,9 @@ bool handleClient(int clientFd, const std::string& clientIp) {
         std::vector<char> dataBuffer;
         if (dataLen > 0) {
             dataBuffer.resize(dataLen);
-            ssize_t dataRecvLen = recv(clientFd, dataBuffer.data(), dataLen, 0);
+            ssize_t dataRecvLen = recv(clientFd, dataBuffer.data(), dataLen, MSG_DONTWAIT);
             if (dataRecvLen != dataLen) {
-                std::cout << "数据接收不完整" << std::endl;
+                std::cout << "数据接收不完整，实际接收：" << dataRecvLen << "，期望：" << dataLen << std::endl;
                 return false;
             }
         }
@@ -343,7 +410,8 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                     for (auto it = g_onlineUsers.begin(); it != g_onlineUsers.end();) {
                         int uid = it->first;
                         int fd = findFdByUserId(uid);
-                        if (fd == -1) { // 无对应FD，判定为僵尸用户
+                        // 不仅检查FD是否存在，还要检查FD是否有效
+                        if (fd == -1 || !isFdValid(fd)) { 
                             std::cout << "清理僵尸用户：ID=" << uid << "，昵称=" << it->second.nickname << std::endl;
                             it = g_onlineUsers.erase(it);
                         } else {
@@ -549,39 +617,38 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 }
                 break;
             }
-            // 新增：处理客户端主动下线通知
-            case MsgType::USER_STATUS_NOTIFY: {
+            // 新增：处理客户端主动下线请求（LOGOUT_REQ）
+            case MsgType::LOGOUT_REQ: {
                 std::cout << "收到客户端主动下线通知（FD=" << clientFd << "）" << std::endl;
                 
-                // 1. 先解析通知（解锁状态下）
-                UserStatusNotify notify;
-                try {
-                    notify = deserialize<UserStatusNotify>(std::string(dataBuffer.begin(), dataBuffer.end()));
-                    std::cout << "主动下线用户：ID=" << notify.userId << "，昵称=" << notify.nickname << std::endl;
-                } catch (...) {
-                    std::cout << "解析主动下线通知失败" << std::endl;
-                    break;
-                }
-
-                // 2. 加锁仅处理必要操作，移除sleep
+                std::string offlineNickname = "";
+                int offlineUserId = -1;
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    // 先广播（非阻塞）
-                    std::string notifyData = serialize(notify);
-                    std::cout << "开始广播主动下线通知：" << notifyData << std::endl;
-                    broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
-                    
-                    // 清理数据（精简）
-                    g_fdToUserId.erase(clientFd);
-                    g_onlineUsers.erase(notify.userId);
-                    g_fdLastHeartbeat.erase(clientFd);
-                } // 立即解锁，避免阻塞
-
-                // 3. 关闭FD（非阻塞）
+                    auto fdIt = g_fdToUserId.find(clientFd);
+                    if (fdIt != g_fdToUserId.end()) {
+                        offlineUserId = fdIt->second;
+                        auto userIt = g_onlineUsers.find(offlineUserId);
+                        if (userIt != g_onlineUsers.end()) {
+                            offlineNickname = userIt->second.nickname;
+                            // 广播主动下线通知
+                            UserStatusNotify notify;
+                            notify.userId = offlineUserId;
+                            notify.nickname = offlineNickname;
+                            notify.isOnline = false;
+                            std::string notifyData = serialize(notify);
+                            broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                            
+                            g_onlineUsers.erase(userIt);
+                        }
+                        g_fdToUserId.erase(fdIt);
+                        g_fdLastHeartbeat.erase(clientFd);
+                    }
+                }
+                
                 shutdown(clientFd, SHUT_RDWR);
                 close(clientFd);
-                
-                std::cout << "主动下线用户处理完成：ID=" << notify.userId << std::endl;
+                std::cout << "主动下线用户处理完成：ID=" << offlineUserId << "，昵称=" << offlineNickname << std::endl;
                 return false;
             }
             default:
@@ -594,12 +661,17 @@ bool handleClient(int clientFd, const std::string& clientIp) {
 
 // 线程入口函数
 void handleClientThread(int clientFd, const std::string& clientIp) {
+    // 设置客户端FD为非阻塞（核心：避免recv卡住）
+    int flags = fcntl(clientFd, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
+    }
+
     handleClient(clientFd, clientIp);
-    close(clientFd);
-    std::cout << "客户端 " << clientIp << " 连接已关闭" << std::endl;
+    std::cout << "客户端 " << clientIp << " 连接处理线程结束" << std::endl;
 }
 
-// 服务器主函数（无修改）
+// 服务器主函数
 int main() {
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) {
