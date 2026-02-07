@@ -3,6 +3,13 @@
 
 #include <QWidget>
 #include <QTcpSocket>
+#include <QUdpSocket>
+#include <QTcpServer>
+#include <QFileDialog>
+#include <QFile>
+#include <QCryptographicHash>
+#include <QBuffer>
+#include <QPixmap>
 #include <QString>
 #include <QTimer>
 #include <QListWidget>
@@ -32,10 +39,16 @@ protected:
     void closeEvent(QCloseEvent *event) override; // 新增
     
 private slots:
+    // 登录流程统一入口
+    void login(const QString& nickname);
     // 发送心跳包
     void sendHeartbeat();
     // 处理服务器数据
     void onServerReadyRead();
+    // 初始化P2P端口，成功true/失败false
+    bool initP2PPorts();
+    // 登录函数中，填充P2P TCP随机端口
+    void sendLoginReq(const QString& nickname); 
     // 发送普通消息
     void sendMessage();
     // 打开图片选择对话框
@@ -51,7 +64,31 @@ private:
     // 处理上线/下线通知
     void processNotification(const MsgType& type, const std::string& data);
     // 发送图片
-    void sendImage(const QString& filePath);
+    void sendImage();
+    void sendImage(const QString& filePath); // 重载版本
+    // 接收图片
+    void receiveImage(const ImageMsg& msg);
+    // 发送文件
+    void sendFile();
+    // 分片发送文件
+    void sendFileFragment(FileMsg metaMsg);
+    // 更新传输进度
+    void updateTransferProgress(int progress);
+    // 接收文件
+    void receiveFile(const FileMsg& metaMsg);
+    // 新增处理点对点新连接的槽函数
+    void onP2PNewConnection();
+    // 新增槽函数：选择在线用户作为接收方
+    void onUserItemClicked(QListWidgetItem* item);
+    // 处理点对点数据接收
+    void onP2PDataReady();
+    // 新增UDP接收槽函数
+    void onUdpReadyRead();
+
+    void onP2PSocketError(QAbstractSocket::SocketError socketError);
+    void onP2PSocketReadyRead();
+    void onP2PSocketDisconnected();
+  
     // 显示聊天消息（仅一个实现）
     void showMessage(const QString& sender, const QString& content, bool isPrivate = false);
 
@@ -63,6 +100,19 @@ private:
     Ui::ChatWindow* ui;
     QLabel* m_userInfoLabel = nullptr;
     bool m_isPrivateChat = false;
+    QTcpSocket* m_tcpP2PSocket;    // 点对点TCP Socket
+    QTcpSocket* m_tcpP2PRecvSocket;// 专门用于被动接收连接
+    QUdpSocket* m_udpP2PSocket;    // 点对点UDP Socket
+    QTcpServer* m_tcpP2PServer;    // 用于接收点对点TCP连接
+    QHostAddress m_targetIp;       // 目标IP
+    quint16 m_targetTcpPort;       // 目标TCP端口
+    quint16 m_targetUdpPort;       // 目标UDP端口
+    quint16 m_p2pTcpPort = 0;      // 保存系统分配的P2P TCP随机端口
+    quint16 m_udpP2PPort = 0;      // UDP监听端口
+    QFile* m_transferFile;         // 传输中的文件
+    qint64 m_totalFileSize;        // 文件总大小
+    qint64 m_sentFileSize;         // 已发送大小
+    int m_selectedUserId = 0;      // 选中的聊天对象ID
 };
 
 #endif // CHATWINDOW_H
