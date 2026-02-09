@@ -524,27 +524,20 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                 rsp.userId = -1;
             } else {
                 std::cout << "3..." << std::endl;
-                // 补充：端口合法性校验（可选，增加健壮性）
-                if (clientDataPort == 0 || clientUdpPort == 0) {
-                    rsp.success = false;
-                    rsp.msg = "登录失败：客户端端口无效（TCP/UDP端口不能为空）";
-                    rsp.userId = -1;
-                } else {
-                    rsp.success = true;
-                    rsp.msg = "登录成功";
-                    rsp.userId = newUserId;
+                rsp.success = true;
+                rsp.msg = "登录成功";
+                rsp.userId = newUserId;
 
-                    // 构造上线通知（无需锁）
-                    std::cout << "4..." << std::endl;
-                    UserStatusNotify notify;
-                    notify.userId = newUserId;
-                    notify.nickname = newNickname;
-                    notify.isOnline = true;
-                    std::string notifyData = nlohmann::json(notify).dump();
-                    // 锁外广播上线通知
-                    broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
-                    std::cout << "5..." << std::endl;
-                }
+                // 构造上线通知（无需锁）
+                std::cout << "4..." << std::endl;
+                UserStatusNotify notify;
+                notify.userId = newUserId;
+                notify.nickname = newNickname;
+                notify.isOnline = true;
+                std::string notifyData = nlohmann::json(notify).dump();
+                // 锁外广播上线通知
+                broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+                std::cout << "5..." << std::endl;
             }
             
             // 4. 发送登录响应（无需锁）
@@ -573,11 +566,43 @@ bool handleClient(int clientFd, const std::string& clientIp) {
         }
         case MsgType::HEARTBEAT: {
             std::cout << "收到心跳包（FD=" << clientFd << "）" << std::endl;
+            // 新增：解析心跳包中携带的最新P2P端口（dataBufferStr是心跳包的data体）
+            uint16_t newDataPort = 0;
+            uint16_t newUdpPort = 0;
+            if (!dataBufferStr.empty()) { // 心跳包有数据（携带端口）
+                try {
+                    nlohmann::json j = nlohmann::json::parse(dataBufferStr);
+                    newDataPort = j.contains("dataPort") ? j["dataPort"].get<uint16_t>() : 0;
+                    newUdpPort = j.contains("udpPort") ? j["udpPort"].get<uint16_t>() : 0;
+                } catch (...) {
+                    std::cout << "心跳包端口解析失败，忽略" << std::endl;
+                }
+            }
+
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
+                // 1. 更新心跳时间戳（原有逻辑保留）
                 g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
+                
+                // 2. 新增核心逻辑：更新全局存储的端口（如果客户端携带了新端口）
+                if (newDataPort > 0) { // 仅当端口有效时更新
+                    auto fdIt = g_fdToUserId.find(clientFd);
+                    if (fdIt != g_fdToUserId.end()) {
+                        int userId = fdIt->second;
+                        auto userIt = g_onlineUsers.find(userId);
+                        if (userIt != g_onlineUsers.end()) {
+                            // 替换旧端口为心跳包中的最新端口
+                            userIt->second.dataPort = newDataPort;
+                            userIt->second.udpPort = newUdpPort;
+                            std::cout << "更新用户端口：UID=" << userId 
+                                    << "，旧端口=" << userIt->second.dataPort 
+                                    << "→新端口=" << newDataPort << std::endl;
+                        }
+                    }
+                }
             }
-            // 修复：心跳响应头部构造错误（统一用htonHeader转换）
+
+            // 心跳响应逻辑（原有逻辑保留）
             PacketHeader rspHeader;
             rspHeader.msgType = static_cast<uint32_t>(MsgType::HEARTBEAT);
             rspHeader.dataLen = 0;
@@ -585,7 +610,7 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             rspHeader.senderId = 0;
             PacketHeader netRspHeader = htonHeader(rspHeader);
             send(clientFd, &netRspHeader, sizeof(PacketHeader), MSG_NOSIGNAL);
-            break; // 注意：不要return false，仅break即可保持连接
+            break;
         }
         case MsgType::COMMON_MSG: {
             std::cout << "收到普通消息（MsgType::COMMON_MSG），dataLen=" << dataLen << std::endl;

@@ -39,14 +39,11 @@ protected:
     void closeEvent(QCloseEvent *event) override; // 新增
     
 private slots:
-    // 登录流程统一入口
-    void login(const QString& nickname);
+
     // 发送心跳包
     void sendHeartbeat();
     // 处理服务器数据
     void onServerReadyRead();
-    // 初始化P2P端口，成功true/失败false
-    bool initP2PPorts();
     // 登录函数中，填充P2P TCP随机端口
     void sendLoginReq(const QString& nickname); 
     // 发送普通消息
@@ -85,6 +82,7 @@ private:
     // 新增UDP接收槽函数
     void onUdpReadyRead();
 
+    void onP2PClientDisconnected();
     void onP2PSocketError(QAbstractSocket::SocketError socketError);
     void onP2PSocketReadyRead();
     void onP2PSocketDisconnected();
@@ -113,6 +111,10 @@ private:
     qint64 m_totalFileSize;        // 文件总大小
     qint64 m_sentFileSize;         // 已发送大小
     int m_selectedUserId = 0;      // 选中的聊天对象ID
+    QTcpSocket* m_p2pClientSocket = nullptr; // 专门存储接收方的P2P客户端连接
+    ImageMsg m_pendingImageMsg;              // 待接收的图片信息
+    QByteArray m_pendingImageData;           // 待接收的图片数据
+    QMap<int, QString> m_userPortMap;        // 缓存用户ID-端口映射（解决端口不匹配）
 };
 
 #endif // CHATWINDOW_H

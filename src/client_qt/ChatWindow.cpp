@@ -36,7 +36,7 @@ ChatWindow::ChatWindow(QWidget *parent)
     , m_isPrivateChat(false) // 初始为公聊
     , m_tcpP2PServer(new QTcpServer(this))
     , m_tcpP2PSocket(nullptr)
-    , m_udpP2PSocket(nullptr)
+    , m_udpP2PSocket(nullptr) // 初始化为nullptr
     , m_transferFile(nullptr)
     , m_totalFileSize(0)
     , m_sentFileSize(0)
@@ -49,24 +49,44 @@ ChatWindow::ChatWindow(QWidget *parent)
     ui->setupUi(this);
     this->setWindowTitle("聊天窗口");
 
-    // 添加用户信息标签到聊天区域顶部
+    // ========== 1. 先初始化必要的UI组件 ==========
     m_userInfoLabel = new QLabel("当前用户：未登录", this);
     ui->verticalLayout->insertWidget(0, m_userInfoLabel); // 插入到聊天框上方
 
-    // ========== 新增：P2P Socket初始化 ==========
+    // ========== 2. 初始化P2P Socket（先创建对象，再操作） ==========
     m_tcpP2PSocket = new QTcpSocket(this);   // 点对点TCP Socket
-    m_udpP2PSocket = new QUdpSocket(this);   // 点对点UDP Socket
+    // 如果你暂时不用UDP，直接注释UDP相关的所有逻辑（包括bind），避免空指针
+    // m_udpP2PSocket = new QUdpSocket(this);   // 点对点UDP Socket（暂时注释）
 
-    // ========== 新增：P2P TCP服务器初始化 ==========
-    // 绑定TCP服务器新连接信号到槽函数（接收其他客户端的P2P连接）
+    // ========== 3. 先绑定TCP服务器信号，再启动监听（规范顺序） ==========
     connect(m_tcpP2PServer, &QTcpServer::newConnection, 
             this, &ChatWindow::onP2PNewConnection);
 
-    // ========== 新增：进度条初始化 ==========
+    // ========== 4. 启动TCP P2P服务器（自动分配端口） ==========
+    if (!m_tcpP2PServer->listen(QHostAddress::Any, 0)) {
+        showMessage("系统错误", QString("P2P TCP服务器启动失败：%1").arg(m_tcpP2PServer->errorString()));
+    } else {
+        // 获取系统实际分配的TCP端口
+        m_p2pTcpPort = m_tcpP2PServer->serverPort();
+        showMessage("系统提示", QString("P2P TCP服务器已启动，自动分配端口：%1").arg(m_p2pTcpPort));
+    }
+
+    // ========== 5. UDP相关逻辑（暂时注释，避免空指针；如需启用，先new再bind） ==========
+    // 如果你要启用UDP，必须先new，再bind：
+    // if (m_udpP2PSocket) { // 先判断对象是否存在
+    //     if (!m_udpP2PSocket->bind(QHostAddress::Any, 0)) {
+    //         showMessage("系统错误", QString("P2P UDP端口绑定失败：%1").arg(m_udpP2PSocket->errorString()));
+    //     } else {
+    //         m_udpP2PPort = m_udpP2PSocket->localPort();
+    //         showMessage("系统提示", QString("P2P UDP端口已绑定，自动分配端口：%1").arg(m_udpP2PPort));
+    //     }
+    // }
+
+    // ========== 6. 进度条初始化 ==========
     ui->progressBar_transfer->setRange(0, 100); // 进度范围0-100
     ui->progressBar_transfer->setValue(0);     // 初始进度0
 
-    // ========== 信号槽绑定（原有+新增） ==========
+    // ========== 7. 信号槽绑定（原有+新增） ==========
     // 原有绑定
     connect(ui->pushButton_getUserList, &QPushButton::clicked, this, &ChatWindow::getOnlineUserList);
     connect(ui->pushButton_send, &QPushButton::clicked, this, &ChatWindow::sendMessage);
@@ -81,7 +101,8 @@ ChatWindow::ChatWindow(QWidget *parent)
 
     connect(ui->listWidget_onlineUsers, &QListWidget::itemClicked, this, &ChatWindow::onUserItemClicked);
 
-    connect(m_udpP2PSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
+    // UDP相关信号槽也暂时注释（避免空指针）
+    // connect(m_udpP2PSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
 
     // 启动心跳定时器
     m_heartbeatTimer->start(10000);
@@ -91,61 +112,10 @@ ChatWindow::~ChatWindow() {
     delete ui; // 释放UI对象
 }
 
-// 将P2P端口初始化抽离为独立函数，确保端口绑定完成后再返回
-bool ChatWindow::initP2PPorts() {
-    // 初始化P2P TCP服务端
-    if (m_tcpP2PServer->isListening()) {
-        m_tcpP2PServer->close(); // 关闭重复的监听
-    }
-    bool tcpServerListenOk = m_tcpP2PServer->listen(QHostAddress::Any, 0);
-    if (!tcpServerListenOk) {
-        showMessage("系统错误", "P2P TCP服务端启动失败：" + m_tcpP2PServer->errorString());
-        return false;
-    }
-    m_p2pTcpPort = m_tcpP2PServer->serverPort();
-    if (m_p2pTcpPort <= 0 || m_p2pTcpPort > 65535) {
-        showMessage("系统错误", "P2P TCP服务端获取端口失败，端口无效");
-        m_tcpP2PServer->close();
-        return false;
-    }
-    showMessage("系统提示", QString("P2P TCP服务端启动成功，监听随机端口：%1").arg(m_p2pTcpPort));
-
-    // 初始化UDP客户端
-    if (m_udpP2PSocket->state() != QUdpSocket::UnconnectedState) {
-        m_udpP2PSocket->close(); // 关闭旧连接
-    }
-    bool udpBindOk = m_udpP2PSocket->bind(QHostAddress::Any, 0);
-    if (!udpBindOk) {
-        showMessage("系统错误", "UDP客户端启动失败：" + m_udpP2PSocket->errorString());
-        return false;
-    }
-    m_udpP2PPort = m_udpP2PSocket->localPort(); // 新增成员变量存储UDP端口
-    if (m_udpP2PPort <= 0 || m_udpP2PPort > 65535) {
-        showMessage("系统错误", "UDP Socket绑定成功，但获取到无效端口");
-        m_udpP2PSocket->close();
-        return false;
-    }
-    showMessage("系统提示", QString("UDP客户端已启动，监听端口：%1").arg(m_udpP2PPort));
-
-    return true;
-}
-
-// 登录流程：先初始化P2P端口，再发送登录请求
-void ChatWindow::login(const QString& nickname) {
-    // 第一步：确保P2P端口初始化完成
-    if (!initP2PPorts()) {
-        showMessage("系统错误", "P2P端口初始化失败，无法登录");
-        return;
-    }
-
-    // 第二步：发送登录请求（此时端口已正确绑定）
-    sendLoginReq(nickname);
-}
-
 // 修正sendLoginReq函数
 void ChatWindow::sendLoginReq(const QString& nickname) {
     // 前置校验：端口必须有效
-    if (m_p2pTcpPort == 0 || m_udpP2PPort == 0) {
+    if (m_p2pTcpPort == 0) {
         showMessage("系统错误", "P2P端口未初始化，无法发送登录请求");
         return;
     }
@@ -153,10 +123,13 @@ void ChatWindow::sendLoginReq(const QString& nickname) {
     LoginReq req;
     req.nickname = nickname.toStdString();
     req.dataPort = m_p2pTcpPort; // 使用初始化后的TCP端口
-    req.udpPort = m_udpP2PPort;  // 使用初始化后的UDP端口
+    req.udpPort = 0;  // UDP禁用，显式传0
+    //req.udpPort = m_udpP2PPort;  // 使用初始化后的UDP端口
     
     std::string jsonStr = nlohmann::json(req).dump();
     sendPacket(m_socket, static_cast<uint32_t>(MsgType::LOGIN_REQ), jsonStr, nextMsgId++, g_currentUserId);
+    // 关键：本地缓存自己的端口，用于校验
+    m_userPortMap[m_userId] = QString::number(m_p2pTcpPort);
     showMessage("系统提示", QString("登录请求已发送，携带P2P端口：TCP=%1，UDP=%2").arg(m_p2pTcpPort).arg(m_udpP2PPort));
 }
 
@@ -215,18 +188,67 @@ void ChatWindow::setLoginInfo(int userId, const QString& nickname, QTcpSocket* s
     g_clientSocket = socket;
     g_currentUserId = userId;
 
-    // 更新用户信息
-    m_userInfoLabel->setText(QString("当前用户：%1（ID：%2）").arg(nickname).arg(userId));
+    // 关键：打印本地监听端口，确认和登录时传递的一致
+    m_userInfoLabel->setText(QString("当前用户：%1（ID：%2，P2P监听端口：%3）")
+                             .arg(nickname).arg(userId).arg(m_p2pTcpPort));
+    showMessage("系统提示", QString("登录成功！本地P2P监听端口：%1，请确认服务端存储的是该端口").arg(m_p2pTcpPort));
 
-    // 连接Socket的readyRead信号
     connect(m_socket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
 }
 
 // 发送心跳包
-void ChatWindow::sendHeartbeat() {
-    if (m_socket && m_socket->state() == QTcpSocket::ConnectedState) {
-        sendPacket(m_socket, static_cast<uint32_t>(MsgType::HEARTBEAT), "", nextMsgId++, m_userId);
+void ChatWindow::sendHeartbeat()
+{
+    // 前置检查：仅当已登录+和服务端连接正常时发送心跳
+    if (m_userId <= 0 || !m_socket || m_socket->state() != QTcpSocket::ConnectedState) {
+        qDebug() << "心跳包发送跳过：未登录或服务端连接断开";
+        return;
     }
+
+    // 1. 获取最新的P2P端口（适配你的成员变量）
+    uint16_t currentTcpPort = 0;
+    // 优先用m_tcpP2PServer的监听端口，其次用缓存的m_p2pTcpPort
+    if (m_tcpP2PServer && m_tcpP2PServer->isListening()) {
+        currentTcpPort = m_tcpP2PServer->serverPort();
+        m_p2pTcpPort = currentTcpPort; // 更新缓存的端口
+    } else if (m_p2pTcpPort > 0) {
+        currentTcpPort = m_p2pTcpPort; // 用缓存的端口
+    }
+
+    uint16_t currentUdpPort = 0;
+    if (m_udpP2PSocket && m_udpP2PSocket->state() == QUdpSocket::BoundState) {
+        currentUdpPort = m_udpP2PSocket->localPort();
+        m_udpP2PPort = currentUdpPort; // 更新缓存的UDP端口
+    } else if (m_udpP2PPort > 0) {
+        currentUdpPort = m_udpP2PPort;
+    }
+
+    // 2. 构造心跳包数据（JSON格式，携带端口）
+    nlohmann::json heartbeatJson;
+    heartbeatJson["dataPort"] = currentTcpPort; // TCP P2P端口
+    heartbeatJson["udpPort"] = currentUdpPort;  // UDP P2P端口
+    std::string heartbeatData = heartbeatJson.dump();
+
+    // 3. 构造协议头部（按你的protocol.h定义）
+    PacketHeader header;
+    header.msgType = static_cast<uint32_t>(MsgType::HEARTBEAT); // 心跳消息类型
+    header.dataLen = heartbeatData.size();                     // 数据体长度
+    header.msgId = 0;                                          // 无消息ID则填0
+    header.senderId = m_userId;                                // 当前登录用户ID
+
+    // 4. 转换为网络字节序（调用你封装的htonHeader函数）
+    PacketHeader netHeader = htonHeader(header);
+
+    // 5. 发送数据（先头部，后数据体）
+    qint64 headerSent = m_socket->write((char*)&netHeader, sizeof(PacketHeader));
+    qint64 dataSent = m_socket->write(heartbeatData.c_str(), heartbeatData.size());
+
+    // 调试输出（可选，方便排查）
+    qDebug() << "[心跳包] 发送成功 | "
+             << "用户ID=" << m_userId << " | "
+             << "TCP端口=" << currentTcpPort << " | "
+             << "UDP端口=" << currentUdpPort << " | "
+             << "发送字节数=" << headerSent + dataSent;
 }
 
 // 处理服务器数据
@@ -418,6 +440,11 @@ void ChatWindow::updateUserList(const std::vector<UserInfo>& users) {
     for (const auto& user : users) {
         QString ipStr = user.ip.empty() ? "未知" : QString::fromStdString(user.ip);
         QString portStr = (user.dataPort <= 0) ? "无" : QString::number(user.dataPort);
+        
+        // 缓存用户ID和端口
+        if (user.userId > 0) {
+            m_userPortMap[user.userId] = portStr;
+        }
         
         QString itemText = QString("%1（ID：%2，IP：%3，端口：%4）")
             .arg(QString::fromStdString(user.nickname))
@@ -871,17 +898,38 @@ void ChatWindow::receiveFile(const FileMsg& metaMsg) {
 
 // 处理点对点新连接的槽函数
 void ChatWindow::onP2PNewConnection() {
-    // 关键：在主线程中获取新连接的QTcpSocket，指定父对象为this（ChatWindow，主线程对象）
-    // 避免指定父对象为m_tcpP2PServer（虽然也在主线程，但this更稳妥）
-    m_tcpP2PSocket = m_tcpP2PServer->nextPendingConnection();
-    m_tcpP2PSocket->setParent(this); // 明确指定父对象为主线程的ChatWindow
+    // 关键：用新增的m_p2pClientSocket存储客户端连接，绝不覆盖发送用的m_tcpP2PSocket
+    m_p2pClientSocket = m_tcpP2PServer->nextPendingConnection();
+    
+    // 空指针校验（必须！）
+    if (!m_p2pClientSocket) {
+        showMessage("系统错误", "获取P2P新连接失败：无可用的客户端Socket");
+        return;
+    }
+    
+    // 指定父对象为ChatWindow，由QT自动管理内存（避免内存泄漏）
+    m_p2pClientSocket->setParent(this);
 
-    // 绑定套接字的信号（数据接收、断开连接）
-    connect(m_tcpP2PSocket, &QTcpSocket::readyRead, this, &ChatWindow::onP2PSocketReadyRead);
-    connect(m_tcpP2PSocket, &QTcpSocket::disconnected, this, &ChatWindow::onP2PSocketDisconnected);
-    connect(m_tcpP2PSocket, &QTcpSocket::errorOccurred, this, &ChatWindow::onP2PSocketError);
+    // 绑定新连接的信号槽（仅针对这个接收用的客户端Socket）
+    connect(m_p2pClientSocket, &QTcpSocket::readyRead, this, &ChatWindow::onP2PSocketReadyRead);
+    connect(m_p2pClientSocket, &QTcpSocket::disconnected, this, &ChatWindow::onP2PClientDisconnected);
+    connect(m_p2pClientSocket, &QTcpSocket::errorOccurred, this, &ChatWindow::onP2PSocketError);
 
-    showMessage("系统提示", QString("P2P 新连接建立：%1:%2").arg(m_tcpP2PSocket->peerAddress().toString()).arg(m_tcpP2PSocket->peerPort()));
+    // 打印精准日志，确认连接信息（便于排查端口/IP问题）
+    showMessage("系统提示", QString("P2P 新连接建立：%1:%2（本地监听端口：%3）")
+                .arg(m_p2pClientSocket->peerAddress().toString())
+                .arg(m_p2pClientSocket->peerPort())
+                .arg(m_tcpP2PServer->serverPort()));
+}
+
+// 新增：客户端连接断开的专属槽函数（避免影响发送用Socket）
+void ChatWindow::onP2PClientDisconnected() {
+    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
+    if (socket) {
+        showMessage("系统提示", "P2P 客户端连接已断开：" + socket->peerAddress().toString());
+        socket->deleteLater(); // 安全释放Socket资源
+        m_p2pClientSocket = nullptr; // 重置接收用Socket指针（仅重置这个！）
+    }
 }
 
 // 槽函数：选择在线用户作为接收方
@@ -1022,6 +1070,7 @@ void ChatWindow::switchChatType() {
     }
 }
 
+//错误处理槽函数
 void ChatWindow::onP2PSocketError(QAbstractSocket::SocketError socketError) {
     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
     if (socket) {
@@ -1029,20 +1078,62 @@ void ChatWindow::onP2PSocketError(QAbstractSocket::SocketError socketError) {
     }
 }
 
+//P2P数据读取槽函数
 void ChatWindow::onP2PSocketReadyRead() {
-    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
-    if (!socket) return;
+    // 指向接收用的m_p2pClientSocket，而非发送用的m_tcpP2PSocket
+    QTcpSocket* socket = m_p2pClientSocket;
+    if (!socket || m_pendingImageMsg.fileSize == 0) {
+        showMessage("系统提示", "无待接收的图片信息，忽略P2P数据");
+        return;
+    }
 
-    // 读取P2P接收的图片数据（后续可完善保存逻辑）
-    QByteArray imgData = socket->readAll();
-    showMessage("系统提示", QString("收到P2P数据：%1字节").arg(imgData.size()));
+    // 读取数据并累加（解决半包问题）
+    QByteArray newData = socket->readAll();
+    m_pendingImageData += newData;
+    
+    // 实时打印接收进度（便于调试）
+    showMessage("系统提示", QString("已接收图片数据：%1/%2字节")
+                .arg(m_pendingImageData.size())
+                .arg(m_pendingImageMsg.fileSize));
+
+    // 数据接收完成，保存图片
+    if (m_pendingImageData.size() >= m_pendingImageMsg.fileSize) {
+        QString saveDir = "./recv_imgs";
+        QDir dir(saveDir);
+        if (!dir.exists()) dir.mkdir(saveDir);
+        
+        // 提取纯文件名（避免路径分隔符问题）
+        QString fileName = QString::fromStdString(m_pendingImageMsg.fileName).split("/").last();
+        QString savePath = QString("%1/%2").arg(saveDir).arg(fileName);
+
+        QFile file(savePath);
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(m_pendingImageData);
+            file.close();
+            showMessage("系统提示", QString("图片接收完成，已保存至：%1（实际大小：%2字节）").arg(savePath).arg(m_pendingImageData.size()));
+        } else {
+            showMessage("系统错误", QString("保存图片失败：%1").arg(file.errorString()));
+        }
+
+        // 重置临时变量，准备接收下一张图片
+        m_pendingImageMsg = ImageMsg();
+        m_pendingImageData.clear();
+        socket->close(); // 关闭当前连接
+    }
 }
 
+//P2P连接断开槽函数
 void ChatWindow::onP2PSocketDisconnected() {
     QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
     if (socket) {
         showMessage("系统提示", "P2P 连接已断开");
         socket->deleteLater(); // 安全删除套接字
-        m_tcpP2PSocket = nullptr;
+        
+        // 仅重置对应的Socket指针：如果是接收用的，重置m_p2pClientSocket；如果是发送用的，重置m_tcpP2PSocket
+        if (socket == m_p2pClientSocket) {
+            m_p2pClientSocket = nullptr;
+        } else if (socket == m_tcpP2PSocket) {
+            m_tcpP2PSocket = nullptr;
+        }
     }
 }
