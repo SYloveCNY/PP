@@ -62,13 +62,26 @@ ChatWindow::ChatWindow(QWidget *parent)
     connect(m_tcpP2PServer, &QTcpServer::newConnection, 
             this, &ChatWindow::onP2PNewConnection);
 
-    // ========== 4. 启动TCP P2P服务器（自动分配端口） ==========
-    if (!m_tcpP2PServer->listen(QHostAddress::Any, 0)) {
-        showMessage("系统错误", QString("P2P TCP服务器启动失败：%1").arg(m_tcpP2PServer->errorString()));
+    // ========== 4. 启动TCP P2P服务器（区间自动选固定端口） ==========
+    const int P2P_PORT_START = 9000; // 端口区间起始（可自定义）
+    const int P2P_PORT_END   = 9100; // 端口区间结束（可自定义）
+    int selectedP2PPort = 0;
+
+    // 从区间里逐个尝试监听，找到第一个可用端口（固定后永不变化）
+    for (int port = P2P_PORT_START; port <= P2P_PORT_END; ++port) {
+        if (m_tcpP2PServer->listen(QHostAddress::Any, port)) {
+            selectedP2PPort = port;
+            break;
+        }
+    }
+
+    // 处理监听结果（容错+日志）
+    if (selectedP2PPort == 0) {
+        showMessage("系统错误", QString("P2P TCP服务器启动失败：%1-%2端口全被占用！").arg(P2P_PORT_START).arg(P2P_PORT_END));
     } else {
-        // 获取系统实际分配的TCP端口
-        m_p2pTcpPort = m_tcpP2PServer->serverPort();
-        showMessage("系统提示", QString("P2P TCP服务器已启动，自动分配端口：%1").arg(m_p2pTcpPort));
+        // 保存固定端口（从此不再变化）
+        m_p2pTcpPort = selectedP2PPort;
+        showMessage("系统提示", QString("P2P TCP服务器已启动，固定监听端口：%1").arg(m_p2pTcpPort));
     }
 
     // ========== 5. UDP相关逻辑（暂时注释，避免空指针；如需启用，先new再bind） ==========
