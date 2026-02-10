@@ -390,13 +390,18 @@ void ChatWindow::onServerReadyRead() {
             case MsgType::IMAGE_MSG: {
                 try {
                     ImageMsg imgMsg = deserializeImageMsg(dataStr);
-                    showMessage("系统提示", QString("收到图片消息：%1（大小：%2字节），准备接收...")
+                    // 核心修复1：立即缓存图片元信息到成员变量（m_pendingImageMsg）
+                    m_pendingImageMsg = imgMsg;
+                    m_pendingImageData.clear(); // 清空旧数据，避免干扰
+                    
+                    showMessage("系统提示", QString("收到图片消息：%1（大小：%2字节），已缓存元信息，等待P2P连接...")
                                 .arg(QString::fromStdString(imgMsg.fileName))
                                 .arg(imgMsg.fileSize));
                     
-                    // 启动接收图片线程
-                    std::thread recvImgThread(&ChatWindow::receiveImage, this, imgMsg);
-                    recvImgThread.detach();
+                    // 核心修复2：删除多余的接收线程（改用信号槽，避免时序冲突）
+                    // 注释/删除下面两行线程代码
+                    // std::thread recvImgThread(&ChatWindow::receiveImage, this, imgMsg);
+                    // recvImgThread.detach();
                 } catch (std::exception& e) {
                     showMessage("解析错误", QString("解析图片消息失败：%1").arg(e.what()));
                 }
@@ -636,73 +641,6 @@ void ChatWindow::sendImage() {
     sendImageDialog();
 }
 
-// 接收图片
-void ChatWindow::receiveImage(const ImageMsg& msg) {
-    QString savePath = QString("./recv_imgs/%1").arg(QString::fromStdString(msg.fileName));
-    QDir dir;
-    if (!dir.exists("./recv_imgs")) {
-        dir.mkdir("./recv_imgs");
-    }
-
-    if (!m_tcpP2PServer->isListening()) {
-        showMessage("系统提示", "P2P TCP服务端未启动，无法接收图片");
-        return;
-    }
-    showMessage("系统提示", QString("等待发送方P2P连接，当前监听端口：%1").arg(m_tcpP2PServer->serverPort()));
-
-    // 等待连接（改为信号槽，避免阻塞）
-    QEventLoop loop;
-    connect(m_tcpP2PServer, &QTcpServer::newConnection, &loop, &QEventLoop::quit);
-    QTimer timeoutTimer;
-    timeoutTimer.setSingleShot(true);
-    connect(&timeoutTimer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    timeoutTimer.start(10000); // 10秒超时
-
-    loop.exec(QEventLoop::ExcludeUserInputEvents);
-
-    // 检查是否超时
-    if (!timeoutTimer.isActive() && !m_tcpP2PServer->hasPendingConnections()) {
-        showMessage("系统提示", "等待P2P连接超时");
-        return;
-    }
-
-    QTcpSocket* clientSocket = m_tcpP2PServer->nextPendingConnection();
-    if (!clientSocket) {
-        showMessage("系统提示", "未接收到P2P连接");
-        return;
-    }
-    clientSocket->setParent(this); // 指定父对象，自动管理内存
-
-    // 读取图片数据（循环读取，避免半包）
-    QByteArray imgData;
-    while (clientSocket->bytesAvailable() > 0 || clientSocket->waitForReadyRead(5000)) {
-        imgData += clientSocket->readAll();
-        // 校验数据大小，避免无限读取
-        if (imgData.size() >= msg.fileSize) {
-            break;
-        }
-    }
-
-    // 保存图片
-    QFile file(savePath);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(imgData);
-        file.close();
-        QMetaObject::invokeMethod(this, "showMessage",
-            Qt::QueuedConnection,
-            Q_ARG(QString, "系统提示"),
-            Q_ARG(QString, QString("图片已保存至：%1（大小：%2字节）").arg(savePath).arg(imgData.size())));
-    } else {
-        QMetaObject::invokeMethod(this, "showMessage",
-            Qt::QueuedConnection,
-            Q_ARG(QString, "系统提示"),
-            Q_ARG(QString, "保存图片失败：" + file.errorString()));
-    }
-
-    clientSocket->close();
-    clientSocket->deleteLater();
-}
-
 // 发送文件
 void ChatWindow::sendFile() {
     QString filePath = QFileDialog::getOpenFileName(this, "选择文件", "", "所有文件 (*.*)");
@@ -923,6 +861,15 @@ void ChatWindow::onP2PNewConnection() {
     // 指定父对象为ChatWindow，由QT自动管理内存（避免内存泄漏）
     m_p2pClientSocket->setParent(this);
 
+    // 核心修复：先检查是否有缓存的待接收图片信息
+    if (m_pendingImageMsg.fileSize <= 0 || m_pendingImageMsg.senderId <= 0) {
+        showMessage("系统提示", "无待接收的图片信息，关闭P2P连接");
+        m_p2pClientSocket->disconnectFromHost();
+        m_p2pClientSocket->deleteLater();
+        m_p2pClientSocket = nullptr;
+        return;
+    }
+
     // 绑定新连接的信号槽（仅针对这个接收用的客户端Socket）
     connect(m_p2pClientSocket, &QTcpSocket::readyRead, this, &ChatWindow::onP2PSocketReadyRead);
     connect(m_p2pClientSocket, &QTcpSocket::disconnected, this, &ChatWindow::onP2PClientDisconnected);
@@ -1092,11 +1039,19 @@ void ChatWindow::onP2PSocketError(QAbstractSocket::SocketError socketError) {
 }
 
 //P2P数据读取槽函数
+//P2P数据读取槽函数
 void ChatWindow::onP2PSocketReadyRead() {
     // 指向接收用的m_p2pClientSocket，而非发送用的m_tcpP2PSocket
     QTcpSocket* socket = m_p2pClientSocket;
-    if (!socket || m_pendingImageMsg.fileSize == 0) {
-        showMessage("系统提示", "无待接收的图片信息，忽略P2P数据");
+    if (!socket) {
+        showMessage("系统提示", "P2P Socket为空，忽略数据");
+        return;
+    }
+
+    // 检查缓存的图片元信息是否有效
+    if (m_pendingImageMsg.fileSize <= 0) {
+        showMessage("系统提示", "无有效的图片元信息（可能缓存失败），关闭连接");
+        socket->disconnectFromHost();
         return;
     }
 
@@ -1129,9 +1084,9 @@ void ChatWindow::onP2PSocketReadyRead() {
         }
 
         // 重置临时变量，准备接收下一张图片
-        m_pendingImageMsg = ImageMsg();
-        m_pendingImageData.clear();
-        socket->close(); // 关闭当前连接
+        m_pendingImageMsg = ImageMsg(); // 清空元信息
+        m_pendingImageData.clear();     // 清空数据
+        socket->close();                // 关闭当前连接
     }
 }
 

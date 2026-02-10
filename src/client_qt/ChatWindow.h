@@ -64,7 +64,7 @@ private:
     void sendImage();
     void sendImage(const QString& filePath); // 重载版本
     // 接收图片
-    void receiveImage(const ImageMsg& msg);
+    // void receiveImage(const ImageMsg& msg);
     // 发送文件
     void sendFile();
     // 分片发送文件
