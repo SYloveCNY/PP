@@ -10,11 +10,21 @@
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QFile>
+#include <QFileDialog>  // 补充：文件选择对话框
 #include <QByteArray>
 #include <QCloseEvent>
 #include <thread>
+#include <QThread>
 #include <QTime>
 #include <QRegularExpression>
+#include <QDir>         // 补充：目录操作
+#include <QCryptographicHash> // 补充：MD5校验
+#include <QMetaObject>  // 补充：跨线程调用
+#include <QEventLoop>   // 补充：事件循环
+#include <QUdpSocket>   // 补充：UDP
+#include <QTcpServer>   // 补充：TCP Server
+#include <QTcpSocket>   // 补充：TCP Socket
+#include <QAbstractSocket> // 补充：Socket错误处理
 #include <iostream>
 #include "../../include/protocol.h"
 #include "../../include/protocol_qt.h"
@@ -55,8 +65,7 @@ ChatWindow::ChatWindow(QWidget *parent)
 
     // ========== 2. 初始化P2P Socket（先创建对象，再操作） ==========
     m_tcpP2PSocket = new QTcpSocket(this);   // 点对点TCP Socket
-    // 如果你暂时不用UDP，直接注释UDP相关的所有逻辑（包括bind），避免空指针
-    // m_udpP2PSocket = new QUdpSocket(this);   // 点对点UDP Socket（暂时注释）
+    m_udpP2PSocket = new QUdpSocket(this);   // 点对点UDP Socket
 
     // ========== 3. 先绑定TCP服务器信号，再启动监听（规范顺序） ==========
     connect(m_tcpP2PServer, &QTcpServer::newConnection, 
@@ -84,16 +93,27 @@ ChatWindow::ChatWindow(QWidget *parent)
         showMessage("系统提示", QString("P2P TCP服务器已启动，固定监听端口：%1").arg(m_p2pTcpPort));
     }
 
-    // ========== 5. UDP相关逻辑（暂时注释，避免空指针；如需启用，先new再bind） ==========
-    // 如果你要启用UDP，必须先new，再bind：
-    // if (m_udpP2PSocket) { // 先判断对象是否存在
-    //     if (!m_udpP2PSocket->bind(QHostAddress::Any, 0)) {
-    //         showMessage("系统错误", QString("P2P UDP端口绑定失败：%1").arg(m_udpP2PSocket->errorString()));
-    //     } else {
-    //         m_udpP2PPort = m_udpP2PSocket->localPort();
-    //         showMessage("系统提示", QString("P2P UDP端口已绑定，自动分配端口：%1").arg(m_udpP2PPort));
-    //     }
-    // }
+    // ========== 5. UDP相关逻辑（修改为和TCP一样的端口区间遍历模式） ==========
+    int selectedUdpPort = 0;
+    // 遍历指定端口区间，找第一个可用的UDP端口
+    for (int port = P2P_PORT_START; port <= P2P_PORT_END; ++port) {
+        // 注意：UDP的bind和TCP的listen参数一致，但逻辑不同（UDP无监听，仅绑定端口）
+        if (m_udpP2PSocket->bind(QHostAddress::Any, port)) {
+            selectedUdpPort = port;
+            break;
+        }
+    }
+
+    // 处理UDP绑定结果（容错+日志）
+    if (selectedUdpPort == 0) {
+        showMessage("系统错误", QString("P2P UDP绑定失败：%1-%2端口全被占用！").arg(P2P_PORT_START).arg(P2P_PORT_END));
+    } else {
+        // 保存固定UDP端口
+        m_udpP2PPort = selectedUdpPort;
+        showMessage("系统提示", QString("P2P UDP端口绑定成功，固定端口：%1").arg(m_udpP2PPort));
+        // 绑定UDP接收信号槽
+        connect(m_udpP2PSocket, &QUdpSocket::readyRead, this, &ChatWindow::onUdpReadyRead);
+    }
 
     // ========== 6. 进度条初始化 ==========
     ui->progressBar_transfer->setRange(0, 100); // 进度范围0-100
@@ -122,6 +142,23 @@ ChatWindow::ChatWindow(QWidget *parent)
 }
 
 ChatWindow::~ChatWindow() {
+    // 安全释放Socket
+    if (m_p2pClientSocket) {
+        m_p2pClientSocket->disconnectFromHost();
+        m_p2pClientSocket->deleteLater();
+    }
+    if (m_tcpP2PSocket) {
+        m_tcpP2PSocket->disconnectFromHost();
+        m_tcpP2PSocket->deleteLater();
+    }
+    if (m_udpP2PSocket) {
+        m_udpP2PSocket->close();
+        m_udpP2PSocket->deleteLater();
+    }
+    if (m_tcpP2PServer) {
+        m_tcpP2PServer->close();
+        m_tcpP2PServer->deleteLater();
+    }
     delete ui; // 释放UI对象
 }
 
@@ -136,8 +173,7 @@ void ChatWindow::sendLoginReq(const QString& nickname) {
     LoginReq req;
     req.nickname = nickname.toStdString();
     req.dataPort = m_p2pTcpPort; // 使用初始化后的TCP端口
-    req.udpPort = 0;  // UDP禁用，显式传0
-    //req.udpPort = m_udpP2PPort;  // 使用初始化后的UDP端口
+    req.udpPort = m_udpP2PPort;  // 使用初始化后的UDP端口
     
     std::string jsonStr = nlohmann::json(req).dump();
     sendPacket(m_socket, static_cast<uint32_t>(MsgType::LOGIN_REQ), jsonStr, nextMsgId++, g_currentUserId);
@@ -398,10 +434,6 @@ void ChatWindow::onServerReadyRead() {
                                 .arg(QString::fromStdString(imgMsg.fileName))
                                 .arg(imgMsg.fileSize));
                     
-                    // 核心修复2：删除多余的接收线程（改用信号槽，避免时序冲突）
-                    // 注释/删除下面两行线程代码
-                    // std::thread recvImgThread(&ChatWindow::receiveImage, this, imgMsg);
-                    // recvImgThread.detach();
                 } catch (std::exception& e) {
                     showMessage("解析错误", QString("解析图片消息失败：%1").arg(e.what()));
                 }
@@ -646,26 +678,41 @@ void ChatWindow::sendFile() {
     QString filePath = QFileDialog::getOpenFileName(this, "选择文件", "", "所有文件 (*.*)");
     if (filePath.isEmpty()) return;
     
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        showMessage("系统提示", "打开文件失败：" + file.errorString());
+    // 关键修改：动态分配QFile，避免局部变量销毁导致野指针
+    if (m_transferFile) { // 先释放旧文件
+        if (m_transferFile->isOpen()) m_transferFile->close();
+        delete m_transferFile;
+        m_transferFile = nullptr;
+    }
+    m_transferFile = new QFile(filePath, this); // 父对象设为ChatWindow，自动管理内存
+    if (!m_transferFile->open(QIODevice::ReadOnly)) {
+        showMessage("系统提示", "打开文件失败：" + m_transferFile->errorString());
+        delete m_transferFile;
+        m_transferFile = nullptr;
         return;
     }
     
     // 获取文件信息
-    m_totalFileSize = file.size();
+    m_totalFileSize = m_transferFile->size();
     m_sentFileSize = 0;
-    m_transferFile = &file;
     
     // 计算MD5
     QCryptographicHash hash(QCryptographicHash::Md5);
-    if (hash.addData(&file)) {
+    if (hash.addData(m_transferFile)) {
         QString fileMd5 = hash.result().toHex();
         
         // 构造文件元信息
         FileMsg fileMsg;
         fileMsg.senderId = m_userId;
         fileMsg.receiverId = ui->lineEdit_privateId->text().toInt();
+        // 校验接收方ID
+        if (fileMsg.receiverId <= 0 || fileMsg.receiverId == m_userId) {
+            showMessage("系统提示", "请输入有效的接收方ID（不能是自己）！");
+            m_transferFile->close();
+            delete m_transferFile;
+            m_transferFile = nullptr;
+            return;
+        }
         fileMsg.fileName = filePath.toStdString();
         fileMsg.fileSize = m_totalFileSize;
         fileMsg.fileData = ""; // 元信息分片无数据
@@ -684,58 +731,126 @@ void ChatWindow::sendFile() {
         sendFileThread.detach();
     } else {
         showMessage("系统提示", "计算文件MD5失败");
-        file.close();
+        m_transferFile->close();
+        delete m_transferFile;
+        m_transferFile = nullptr;
     }
 }
 
 // 分片发送文件
 void ChatWindow::sendFileFragment(FileMsg metaMsg) {
-    const qint64 fragmentSize = 1024 * 1024; // 1MB
+    if (!m_transferFile || !m_transferFile->isOpen()) {
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, "文件未打开，无法发送分片"));
+        return;
+    }
+
+    // 等待P2P地址就绪（关键！发送前必须确保目标地址有效）
+    int waitCount = 0;
+    while (m_targetIp.isNull() || (metaMsg.protocol == TransportProtocol::TCP && m_targetTcpPort == 0) || 
+           (metaMsg.protocol == TransportProtocol::UDP && m_targetUdpPort == 0)) {
+        if (waitCount >= 30) { // 最多等3秒
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, "获取P2P地址超时，无法发送文件分片"));
+            m_transferFile->close();
+            return;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        waitCount++;
+    }
+
+    const qint64 fragmentSize = 1024 * 1024; // 1MB分片
     qint64 offset = 0;
-    
-    for (uint32_t idx = 1; idx <= metaMsg.totalFragments; idx++) {
+    bool sendSuccess = true;
+
+    for (uint32_t idx = 1; idx <= metaMsg.totalFragments && sendSuccess; idx++) {
         // 读取分片数据
         m_transferFile->seek(offset);
         QByteArray fragmentData = m_transferFile->read(fragmentSize);
-        
+        if (fragmentData.isEmpty() && idx != metaMsg.totalFragments) {
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, QString("读取分片%1失败").arg(idx)));
+            sendSuccess = false;
+            break;
+        }
+
         // 构造分片消息
         FileMsg fragMsg = metaMsg;
         fragMsg.fragmentIdx = idx;
         fragMsg.fileData = fragmentData.toBase64().toStdString();
         fragMsg.dataLen = fragmentData.size();
-        
-        // 点对点发送
         std::string fragData = serialize(fragMsg);
+
+        // 发送分片
         if (metaMsg.protocol == TransportProtocol::TCP) {
+            // TCP发送：确保连接已建立
             if (m_tcpP2PSocket->state() != QTcpSocket::ConnectedState) {
+                m_tcpP2PSocket->abort();
                 m_tcpP2PSocket->connectToHost(m_targetIp, m_targetTcpPort);
-                m_tcpP2PSocket->waitForConnected(3000);
+                if (!m_tcpP2PSocket->waitForConnected(2000)) {
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统错误"),
+                        Q_ARG(QString, QString("连接接收方TCP端口失败：%1").arg(m_tcpP2PSocket->errorString())));
+                    sendSuccess = false;
+                    break;
+                }
             }
-            m_tcpP2PSocket->write(fragData.c_str(), fragData.size());
-            m_tcpP2PSocket->flush();
+
+            // 发送数据并确保写入
+            qint64 sent = m_tcpP2PSocket->write(fragData.c_str(), fragData.size());
+            if (sent <= 0 || !m_tcpP2PSocket->waitForBytesWritten(1000)) {
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, QString("发送分片%1失败").arg(idx)));
+                sendSuccess = false;
+                break;
+            }
         } else {
-            m_udpP2PSocket->writeDatagram(fragData.c_str(), fragData.size(), m_targetIp, m_targetUdpPort);
+            // UDP发送
+            qint64 sent = m_udpP2PSocket->writeDatagram(fragData.c_str(), fragData.size(), m_targetIp, m_targetUdpPort);
+            if (sent <= 0) {
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, QString("发送UDP分片%1失败").arg(idx)));
+                sendSuccess = false;
+                break;
+            }
         }
-        
+
         // 更新进度
         m_sentFileSize += fragmentData.size();
         int progress = static_cast<int>((m_sentFileSize * 100) / m_totalFileSize);
         QMetaObject::invokeMethod(this, "updateTransferProgress",
             Qt::QueuedConnection,
             Q_ARG(int, progress));
-        
+
         offset += fragmentSize;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 避免发送过快
+        QThread::msleep(10); // 避免发送过快
     }
-    
-    // 发送完成
-    QMetaObject::invokeMethod(this, "showMessage",
-        Qt::QueuedConnection,
-        Q_ARG(QString, m_nickname),
-        Q_ARG(QString, QString("文件 %1 发送完成（MD5：%2）")
-              .arg(QString::fromStdString(metaMsg.fileName))
-              .arg(QString::fromStdString(metaMsg.fileMd5))));
-    
+
+    // 发送完成/失败提示
+    if (sendSuccess) {
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, m_nickname),
+            Q_ARG(QString, QString("文件 %1 发送完成（MD5：%2）").arg(QString::fromStdString(metaMsg.fileName)).arg(QString::fromStdString(metaMsg.fileMd5))));
+    } else {
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, QString("文件 %1 发送失败").arg(QString::fromStdString(metaMsg.fileName))));
+    }
+
     m_transferFile->close();
 }
 
@@ -746,101 +861,242 @@ void ChatWindow::updateTransferProgress(int progress) {
 
 // 接收文件
 void ChatWindow::receiveFile(const FileMsg& metaMsg) {
-    QString savePath = QString("./recv_files/%1").arg(QString::fromStdString(metaMsg.fileName));
+    // ========== 修复1：确保目录存在（递归创建） ==========
+    QString saveDir = "./recv_files";
     QDir dir;
-    if (!dir.exists("./recv_files")) {
-        dir.mkdir("./recv_files");
-    }
-    
-    QFile file(savePath);
-    if (!file.open(QIODevice::WriteOnly)) {
+    if (!dir.mkpath(saveDir)) {
+        QString errorMsg = "创建保存目录失败：" + saveDir;
         QMetaObject::invokeMethod(this, "showMessage",
             Qt::QueuedConnection,
-            Q_ARG(QString, "系统提示"),
-            Q_ARG(QString, "打开保存文件失败：" + file.errorString()));
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, errorMsg));
         return;
     }
-    
-    // 接收分片
+
+    // ========== 修复2：提取纯文件名（避免路径分隔符问题） ==========
+    QString fileName = QString::fromStdString(metaMsg.fileName).split("/").last();
+    fileName = fileName.split("\\").last(); // 兼容Windows路径
+    QString savePath = QString("%1/%2").arg(saveDir).arg(fileName);
+
+    // ========== 修复3：提前检查文件是否可写 ==========
+    QFile file(savePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        QString errorMsg = QString("打开保存文件失败：%1 | 路径：%2").arg(file.errorString()).arg(savePath);
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, errorMsg));
+        return;
+    }
+
+    // ========== 修复4：初始化分片缓存和进度 ==========
     QMap<uint32_t, QByteArray> fragMap; // 分片缓存（解决乱序）
-    // 修复：使用QTcpServer接收TCP连接
+    int totalFragments = metaMsg.totalFragments;
+    QString progressMsg = QString("开始接收文件分片：共%1片").arg(totalFragments);
+    QMetaObject::invokeMethod(this, "showMessage",
+        Qt::QueuedConnection,
+        Q_ARG(QString, "系统提示"),
+        Q_ARG(QString, progressMsg));
+
+    // ========== 修复5：分协议接收数据 ==========
     if (metaMsg.protocol == TransportProtocol::TCP) {
-        // 检查P2P服务端是否正常监听
-        if (!m_tcpP2PServer->isListening()) {
+        // TCP接收逻辑（保持不变）
+        if (!m_tcpP2PServer || !m_tcpP2PServer->isListening()) {
             QMetaObject::invokeMethod(this, "showMessage",
                 Qt::QueuedConnection,
-                Q_ARG(QString, "系统提示"),
-                Q_ARG(QString, "P2P TCP服务端未启动，无法接收文件分片"));
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, "P2P TCP服务器未启动，无法接收文件"));
             file.close();
             return;
         }
 
         QEventLoop loop;
+        QTimer timeoutTimer;
+        timeoutTimer.setSingleShot(true);
+        timeoutTimer.setInterval(10000); // 10秒超时
+        connect(&timeoutTimer, &QTimer::timeout, &loop, &QEventLoop::quit);
         connect(m_tcpP2PServer, &QTcpServer::newConnection, &loop, &QEventLoop::quit);
-        
-        while (fragMap.size() < metaMsg.totalFragments) {
+
+        while (fragMap.size() < totalFragments) {
+            timeoutTimer.start();
             loop.exec(QEventLoop::ExcludeUserInputEvents);
+
+            if (!timeoutTimer.isActive()) {
+                QString timeoutMsg = QString("接收文件分片超时，已接收%1/%2片").arg(fragMap.size()).arg(totalFragments);
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, timeoutMsg));
+                break;
+            }
+
             QTcpSocket* clientSocket = m_tcpP2PServer->nextPendingConnection();
-            if (!clientSocket) break; // 防止空指针
+            if (!clientSocket) continue;
+
+            if (!clientSocket->waitForReadyRead(5000)) {
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, "读取分片数据超时"));
+                clientSocket->close();
+                clientSocket->deleteLater();
+                continue;
+            }
 
             QByteArray fragData = clientSocket->readAll();
-            FileMsg fragMsg = deserializeFileMsg(fragData.toStdString());
-            fragMap[fragMsg.fragmentIdx] = QByteArray::fromBase64(QString::fromStdString(fragMsg.fileData).toUtf8());
-            clientSocket->close();
-            clientSocket->deleteLater();
-            
-            int progress = static_cast<int>((fragMap.size() * 100) / metaMsg.totalFragments);
-            QMetaObject::invokeMethod(this, "updateTransferProgress",
-                Qt::QueuedConnection,
-                Q_ARG(int, progress));
-        }
-    } else {
-        QUdpSocket udpSocket;
-        udpSocket.bind(QHostAddress::Any, m_targetUdpPort);
-        while (fragMap.size() < metaMsg.totalFragments) {
-            while (udpSocket.hasPendingDatagrams()) {
-                QByteArray fragData;
-                fragData.resize(udpSocket.pendingDatagramSize());
-                udpSocket.readDatagram(fragData.data(), fragData.size());
+            if (fragData.isEmpty()) {
+                clientSocket->close();
+                clientSocket->deleteLater();
+                continue;
+            }
+
+            try {
                 FileMsg fragMsg = deserializeFileMsg(fragData.toStdString());
                 fragMap[fragMsg.fragmentIdx] = QByteArray::fromBase64(QString::fromStdString(fragMsg.fileData).toUtf8());
+                
+                int progress = static_cast<int>((fragMap.size() * 100) / totalFragments);
+                QMetaObject::invokeMethod(this, "updateTransferProgress",
+                    Qt::QueuedConnection,
+                    Q_ARG(int, progress));
+
+                QString fragMsgStr = QString("已接收分片%1/%2").arg(fragMsg.fragmentIdx).arg(totalFragments);
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统提示"),
+                    Q_ARG(QString, fragMsgStr));
+            } catch (std::exception& e) {
+                QString errMsg = QString("解析分片失败：%1").arg(e.what());
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, errMsg));
             }
-            int progress = static_cast<int>((fragMap.size() * 100) / metaMsg.totalFragments);
-            QMetaObject::invokeMethod(this, "updateTransferProgress",
+
+            clientSocket->close();
+            clientSocket->deleteLater();
+        }
+    } else {
+        // ========== 修复核心：UDP接收逻辑 ==========
+        // 1. 复用全局的m_udpP2PSocket，不再新建Socket绑定（避免端口冲突）
+        if (!m_udpP2PSocket || m_udpP2PSocket->state() != QUdpSocket::BoundState) {
+            QString udpErrMsg = QString("全局UDP Socket未绑定，无法接收文件分片");
+            QMetaObject::invokeMethod(this, "showMessage",
                 Qt::QueuedConnection,
-                Q_ARG(int, progress));
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, udpErrMsg));
+            file.close();
+            return;
+        }
+
+        // 2. 临时存储文件分片的UDP数据（避免和图片UDP数据混淆）
+        bool isReceivingFile = true;
+        QTimer timeoutTimer;
+        timeoutTimer.setSingleShot(true);
+        timeoutTimer.setInterval(15000); // 15秒超时
+        timeoutTimer.start();
+
+        // 3. 临时连接UDP读取信号（仅用于本次文件接收）
+        QMetaObject::Connection udpConn = connect(m_udpP2PSocket, &QUdpSocket::readyRead, [&]() {
+            while (m_udpP2PSocket->hasPendingDatagrams() && isReceivingFile) {
+                QByteArray fragData;
+                fragData.resize(m_udpP2PSocket->pendingDatagramSize());
+                QHostAddress senderAddr;
+                quint16 senderPort;
+                m_udpP2PSocket->readDatagram(fragData.data(), fragData.size(), &senderAddr, &senderPort);
+
+                try {
+                    // 尝试反序列化为文件分片（失败则不是文件数据）
+                    FileMsg fragMsg = deserializeFileMsg(fragData.toStdString());
+                    fragMap[fragMsg.fragmentIdx] = QByteArray::fromBase64(QString::fromStdString(fragMsg.fileData).toUtf8());
+                    
+                    int progress = static_cast<int>((fragMap.size() * 100) / totalFragments);
+                    QMetaObject::invokeMethod(this, "updateTransferProgress",
+                        Qt::QueuedConnection,
+                        Q_ARG(int, progress));
+
+                    // 仅打印文件分片接收日志，不保存为图片
+                    QString fragLog = QString("已接收UDP文件分片%1/%2（来自%3:%4）")
+                        .arg(fragMsg.fragmentIdx).arg(totalFragments)
+                        .arg(senderAddr.toString()).arg(senderPort);
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统提示"),
+                        Q_ARG(QString, fragLog));
+                } catch (std::exception& e) {
+                    // 不是文件分片数据，跳过（交给原有onUdpReadyRead处理）
+                    qDebug() << "非文件UDP数据，跳过解析：" << e.what();
+                }
+            }
+        });
+
+        // 4. 循环等待接收所有分片
+        while (fragMap.size() < totalFragments && timeoutTimer.isActive()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // 5. 断开临时UDP连接，清理状态
+        disconnect(udpConn);
+        isReceivingFile = false;
+
+        if (timeoutTimer.isActive()) {
+            timeoutTimer.stop();
+        } else {
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, "UDP接收文件超时"));
         }
     }
-    
-    // 合并分片
-    for (uint32_t idx = 1; idx <= metaMsg.totalFragments; idx++) {
-        file.write(fragMap[idx]);
-    }
-    file.close();
-    
-    // 校验MD5
-    QFile checkFile(savePath);
-    checkFile.open(QIODevice::ReadOnly);
-    QCryptographicHash hash(QCryptographicHash::Md5);
-    hash.addData(&checkFile);
-    QString checkMd5 = hash.result().toHex();
-    checkFile.close();
-    
-    if (checkMd5 == QString::fromStdString(metaMsg.fileMd5)) {
-        QMetaObject::invokeMethod(this, "showMessage",
-            Qt::QueuedConnection,
-            Q_ARG(QString, "系统提示"),
-            Q_ARG(QString, QString("文件 %1 接收完成，已保存至：%2（MD5校验通过）")
-                  .arg(QString::fromStdString(metaMsg.fileName))
-                  .arg(savePath)));
+
+    // ========== 修复6：合并分片并校验 ==========
+    if (fragMap.size() == totalFragments) {
+        for (uint32_t idx = 1; idx <= totalFragments; idx++) {
+            file.write(fragMap[idx]);
+        }
+        file.close();
+
+        // MD5校验
+        QFile checkFile(savePath);
+        if (checkFile.open(QIODevice::ReadOnly)) {
+            QCryptographicHash hash(QCryptographicHash::Md5);
+            hash.addData(&checkFile);
+            QString checkMd5 = hash.result().toHex();
+            checkFile.close();
+
+            if (checkMd5 == QString::fromStdString(metaMsg.fileMd5)) {
+                QString successMsg = QString("文件接收完成！已保存至：%1（MD5校验通过）").arg(savePath);
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统提示"),
+                    Q_ARG(QString, successMsg));
+            } else {
+                QString md5ErrMsg = QString("文件接收完成，但MD5校验失败！本地：%1，期望：%2")
+                    .arg(checkMd5)
+                    .arg(QString::fromStdString(metaMsg.fileMd5));
+                QMetaObject::invokeMethod(this, "showMessage",
+                    Qt::QueuedConnection,
+                    Q_ARG(QString, "系统错误"),
+                    Q_ARG(QString, md5ErrMsg));
+                QFile::remove(savePath);
+            }
+        } else {
+            QString md5CheckErr = QString("无法打开文件进行MD5校验：%1").arg(checkFile.errorString());
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, md5CheckErr));
+        }
     } else {
+        file.close();
+        QFile::remove(savePath);
+        QString fragIncompleteMsg = QString("文件接收失败：仅收到%1/%2个分片").arg(fragMap.size()).arg(totalFragments);
         QMetaObject::invokeMethod(this, "showMessage",
             Qt::QueuedConnection,
-            Q_ARG(QString, "系统提示"),
-            Q_ARG(QString, QString("文件 %1 接收完成，但MD5校验失败！")
-                  .arg(QString::fromStdString(metaMsg.fileName))));
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, fragIncompleteMsg));
     }
-    
+
     // 重置进度条
     QMetaObject::invokeMethod(this, "updateTransferProgress",
         Qt::QueuedConnection,
@@ -932,28 +1188,48 @@ void ChatWindow::onP2PDataReady() {
 
 // 新增UDP接收槽函数
 void ChatWindow::onUdpReadyRead() {
+    if (!m_udpP2PSocket) return; // 判空
+
     while (m_udpP2PSocket->hasPendingDatagrams()) {
         QByteArray datagram;
         datagram.resize(m_udpP2PSocket->pendingDatagramSize());
         QHostAddress senderAddr;
         quint16 senderPort;
-        // 读取UDP数据
-        m_udpP2PSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
+        qint64 readLen = m_udpP2PSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
+        if (readLen <= 0) continue; // 读取失败直接跳过
         
-        showMessage("系统提示", QString("收到UDP数据：来自%1:%2，长度%3字节")
-                    .arg(senderAddr.toString())
-                    .arg(senderPort)
-                    .arg(datagram.size()));
-        
-        // 判定是否为图片数据
-        if (datagram.size() > 0) {
-            // 保存UDP图片数据
-            QString savePath = QString("./recv_imgs/udp_%1.jpg").arg(QTime::currentTime().toString("hhmmss"));
-            QFile file(savePath);
+        // ========== 核心修复：先尝试识别是否为文件分片，不是再当作图片处理 ==========
+        try {
+            // 尝试反序列化为文件分片
+            FileMsg fragMsg = deserializeFileMsg(datagram.toStdString());
+            // 如果成功，说明是文件数据，仅打印日志，不保存为图片
+            showMessage("系统提示", QString("收到UDP文件分片：来自%1:%2，分片ID：%3")
+                        .arg(senderAddr.toString())
+                        .arg(senderPort)
+                        .arg(fragMsg.fragmentIdx));
+            continue; // 跳过图片保存逻辑
+        } catch (std::exception& e) {
+            // 不是文件分片，判定为图片数据
+            showMessage("系统提示", QString("收到UDP图片数据：来自%1:%2，长度%3字节")
+                        .arg(senderAddr.toString())
+                        .arg(senderPort)
+                        .arg(datagram.size()));
+            
+            // 保存图片数据（仅处理真正的图片）
+            QString saveDir = "./recv_imgs";
+            QDir dir(saveDir);
+            if (!dir.exists()) dir.mkdir(saveDir);
+
+            // 生成唯一文件名（基于时间戳+随机数，避免重复）
+            QString timestamp = QTime::currentTime().toString("hhmmsszzz");
+            QString savePath = QString("%1/udp_img_%2.jpg").arg(saveDir).arg(timestamp);
+            QFile file(savePath); 
             if (file.open(QIODevice::WriteOnly)) {
                 file.write(datagram);
                 file.close();
                 showMessage("系统提示", QString("UDP图片已保存至：%1").arg(savePath));
+            } else {
+                showMessage("系统错误", QString("保存UDP图片失败：%1").arg(file.errorString()));
             }
         }
     }
