@@ -26,6 +26,9 @@ std::map<int, std::chrono::steady_clock::time_point> g_fdLastHeartbeat;
 const int HEARTBEAT_TIMEOUT_SEC = 15;
 std::thread g_heartbeatCheckThread;
 bool g_isRunning = true;
+int m_udpRelaySocket = -1;                          // UDP中继套接字（原生fd）
+int m_tcpRelayServer = -1;                          // TCP中继服务端套接字
+std::map<int, UserRelayInfo> m_userRelayMap;        // 用户ID -> 中继信息
 
 // ==================== 核心广播/线程函数声明 ====================
 // 对外接口（带默认参数，注意：默认参数只能在声明中出现一次）
@@ -74,6 +77,12 @@ bool handleClient(int clientFd, const std::string& clientIp);
 bool isFdValid(int fd);
 // 清理超时的僵尸用户（移到锁外执行，优化性能）
 void cleanZombieUsers();
+
+// 内网穿透
+// 服务端新增UDP中继处理
+void onUdpReadyRead();
+// 服务端新增TCP中继处理
+void onTcpRelayNewConnection();
 
 // 检查FD是否有效（核心：判断旧FD是否真的失效）
 bool isFdValid(int fd) {
@@ -951,6 +960,115 @@ void handleClientThread(int clientFd, const std::string& clientIp) {
 
     handleClient(clientFd, clientIp);
     std::cout << "客户端 " << clientIp << " 连接处理线程结束" << std::endl;
+}
+
+// 服务端新增UDP中继处理
+void onUdpReadyRead() {
+    if (m_udpRelaySocket < 0) return;
+
+    char buffer[4096] = {0};
+    struct sockaddr_in senderAddr;
+    socklen_t addrLen = sizeof(senderAddr);
+    
+    // 接收UDP数据报
+    ssize_t readLen = recvfrom(m_udpRelaySocket, buffer, sizeof(buffer), 0, 
+                               (struct sockaddr*)&senderAddr, &addrLen);
+    if (readLen <= 0) return;
+
+    // 解析转发请求（格式：senderId|receiverId|data）
+    std::string dataStr(buffer, readLen);
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while ((pos = dataStr.find("|")) != std::string::npos) {
+        parts.push_back(dataStr.substr(0, pos));
+        dataStr.erase(0, pos + 1);
+    }
+    parts.push_back(dataStr);
+
+    if (parts.size() < 3) return;
+
+    int senderId = std::stoi(parts[0]);
+    int receiverId = std::stoi(parts[1]);
+    std::string realData = parts[2];
+
+    // 查找接收方的中继连接
+    if (m_userRelayMap.count(receiverId)) {
+        UserRelayInfo info = m_userRelayMap[receiverId];
+        // 转发数据到接收方
+        struct sockaddr_in targetAddr;
+        memset(&targetAddr, 0, sizeof(targetAddr));
+        targetAddr.sin_family = AF_INET;
+        targetAddr.sin_port = htons(info.udpPort);
+        inet_pton(AF_INET, info.addr.c_str(), &targetAddr.sin_addr);
+        
+        sendto(m_udpRelaySocket, realData.c_str(), realData.size(), 0,
+               (struct sockaddr*)&targetAddr, sizeof(targetAddr));
+    }
+}
+
+// TCP中继认证函数
+int getUserIdFromAuth(int clientSocket) {
+    // 临时实现：返回默认用户ID（后续可根据实际认证逻辑修改，比如从客户端发送的认证数据中解析）
+    // 示例逻辑：读取客户端发送的第一个数据包，解析出userId
+    char authBuffer[128] = {0};
+    ssize_t len = recv(clientSocket, authBuffer, sizeof(authBuffer), MSG_PEEK); // 只查看不读取
+    if (len > 0) {
+        try {
+            return std::stoi(std::string(authBuffer));
+        } catch (...) {
+            return 0;
+        }
+    }
+    return 0; // 默认返回0，表示未认证
+}
+
+// 服务端新增TCP中继处理
+void onTcpRelayNewConnection() {
+    if (m_tcpRelayServer < 0) return;
+
+    // 接收新TCP连接
+    struct sockaddr_in clientAddr;
+    socklen_t addrLen = sizeof(clientAddr);
+    int clientSocket = accept(m_tcpRelayServer, (struct sockaddr*)&clientAddr, &addrLen);
+    if (clientSocket < 0) return;
+
+    // 验证客户端身份（占位函数）
+    int userId = getUserIdFromAuth(clientSocket);
+    
+    // 保存客户端中继信息
+    m_userRelayMap[userId].tcpSocket = clientSocket;
+    m_userRelayMap[userId].addr = inet_ntoa(clientAddr.sin_addr);
+    m_userRelayMap[userId].tcpPort = ntohs(clientAddr.sin_port);
+
+    // 设置非阻塞
+    int flags = fcntl(clientSocket, F_GETFL, 0);
+    fcntl(clientSocket, F_SETFL, flags | O_NONBLOCK);
+
+    // 处理客户端数据（模拟Qt的readyRead信号）
+    char buffer[4096] = {0};
+    ssize_t readLen = recv(clientSocket, buffer, sizeof(buffer), MSG_DONTWAIT);
+    if (readLen > 0) {
+        std::string data(buffer, readLen);
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        while ((pos = data.find("|")) != std::string::npos) {
+            parts.push_back(data.substr(0, pos));
+            data.erase(0, pos + 1);
+        }
+        parts.push_back(data);
+
+        if (parts.size() < 3) return;
+        int receiverId = std::stoi(parts[1]);
+        std::string realData = parts[2];
+
+        // 转发数据到接收方
+        if (m_userRelayMap.count(receiverId)) {
+            int receiverSocket = m_userRelayMap[receiverId].tcpSocket;
+            if (receiverSocket > 0) {
+                send(receiverSocket, realData.c_str(), realData.size(), MSG_NOSIGNAL);
+            }
+        }
+    }
 }
 
 // 服务器主函数

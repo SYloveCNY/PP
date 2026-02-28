@@ -153,6 +153,15 @@ struct P2PAddrNotify {
     uint32_t senderId = 0;      // 发起方ID
 };
 
+// 中继用户信息
+struct UserRelayInfo {
+    std::string addr;       // 用户IP（字符串）
+    uint16_t udpPort;       // UDP端口
+    int tcpSocket;          // TCP套接字（文件描述符）
+    uint16_t tcpPort;       // TCP端口
+    UserRelayInfo() : udpPort(0), tcpSocket(-1), tcpPort(0) {}
+};
+
 // JSON序列化特化（补充所有新增结构体）
 namespace nlohmann {
 template <> struct adl_serializer<UserInfo> {
