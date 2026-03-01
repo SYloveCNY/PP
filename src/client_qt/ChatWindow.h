@@ -16,6 +16,7 @@
 #include <QCloseEvent>
 #include <QMap>
 #include <QMutex>
+#include <QScrollBar>
 #include "../../include/protocol.h"
 
 namespace Ui
@@ -100,6 +101,10 @@ private:
     void safeSendFileFragment(FileMsg metaMsg);
     // 新增内网IP判断函数
     bool isPrivateIp(const QHostAddress& addr);
+    // 气泡消息工具函数
+    void addMessage(const QString& sender, const QString& content, bool isSelf = false);
+    // 生成气泡HTML
+    QString generateBubbleHtml(const QString& sender, const QString& content, bool isSelf);
       
 private:
     // 成员变量

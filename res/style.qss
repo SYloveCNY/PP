@@ -1,0 +1,159 @@
+/* ========== 全局样式 ========== */
+QWidget {
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 14px;
+    color: #333333;
+}
+
+/* ========== 主窗口 ========== */
+ChatWindow {
+    background-color: #F5F5F5;
+}
+
+/* ========== 在线用户分组框 ========== */
+QGroupBox {
+    font-weight: bold;
+    border: 1px solid #DDDDDD;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 8px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 8px 0 8px;
+}
+
+/* ========== 在线用户列表 ========== */
+QListWidget#listWidget_onlineUsers {
+    border: none;
+    background-color: white;
+    border-radius: 6px;
+    padding: 5px;
+}
+
+QListWidget#listWidget_onlineUsers::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin: 2px 0;
+}
+
+QListWidget#listWidget_onlineUsers::item:selected {
+    background-color: #E8F4FD;
+    color: #1677FF;
+}
+
+QListWidget#listWidget_onlineUsers::item:hover {
+    background-color: #F0F7FF;
+}
+
+/* ========== 聊天日志框（核心） ========== */
+QTextEdit#textEdit_chatLog {
+    border: none;
+    background-color: #EDEDED;
+    border-radius: 8px;
+    padding: 10px;
+    line-height: 1.5;
+}
+
+/* ========== 进度条 ========== */
+QProgressBar {
+    border: none;
+    border-radius: 10px;
+    height: 8px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background-color: #07C160;
+    border-radius: 10px;
+}
+
+/* ========== 输入框 ========== */
+QLineEdit {
+    border: 1px solid #DDDDDD;
+    border-radius: 20px;
+    padding: 8px 15px;
+    background-color: white;
+}
+
+QLineEdit:focus {
+    border-color: #1677FF;
+    outline: none;
+}
+
+/* ========== 下拉框 ========== */
+QComboBox {
+    border: 1px solid #DDDDDD;
+    border-radius: 20px;
+    padding: 6px 15px;
+    background-color: white;
+}
+
+QComboBox::drop-down {
+    border: none;
+}
+
+QComboBox::down-arrow {
+    image: url(:/icons/arrow_down.png);
+    width: 12px;
+    height: 12px;
+}
+
+/* ========== 按钮通用样式 ========== */
+QPushButton {
+    border: none;
+    border-radius: 20px;
+    padding: 8px 16px;
+    background-color: #1677FF;
+    color: white;
+}
+
+QPushButton:hover {
+    background-color: #4096FF;
+}
+
+QPushButton:pressed {
+    background-color: #0E66D9;
+}
+
+QPushButton:disabled {
+    background-color: #CCCCCC;
+    color: #999999;
+}
+
+/* ========== 特殊按钮样式 ========== */
+/* 发送消息按钮（微信绿） */
+QPushButton#pushButton_send {
+    background-color: #07C160;
+}
+
+QPushButton#pushButton_send:hover {
+    background-color: #06B050;
+}
+
+QPushButton#pushButton_send:pressed {
+    background-color: #059F40;
+}
+
+/* 获取用户列表按钮（浅灰） */
+QPushButton#pushButton_getUserList {
+    background-color: #F5F5F5;
+    color: #333333;
+    border: 1px solid #DDDDDD;
+}
+
+QPushButton#pushButton_getUserList:hover {
+    background-color: #EEEEEE;
+}
+
+/* 发送图片/文件按钮（浅蓝） */
+QPushButton#pushButton_sendImage, QPushButton#pushButton_sendFile {
+    background-color: #E8F4FD;
+    color: #1677FF;
+}
+
+QPushButton#pushButton_sendImage:hover, QPushButton#pushButton_sendFile:hover {
+    background-color: #D1E9FF;
+}

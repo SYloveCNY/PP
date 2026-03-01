@@ -1321,38 +1321,24 @@ void ChatWindow::onUdpReadyRead() {
 
 // 显示聊天消息
 void ChatWindow::showMessage(const QString& sender, const QString& content, bool isPrivate) {
-    QString prefix = isPrivate ? "[私聊] " : "";
-    // 区分消息类型（图片/文件/文本）
-    QString typePrefix = "";
-    if (content.contains("图片消息") || content.contains(".jpg") || content.contains(".png")) {
-        typePrefix = "[图片] ";
-    } else if (content.contains("文件消息") || content.contains(".zip") || content.contains(".txt")) {
-        typePrefix = "[文件] ";
-    } else {
-        typePrefix = "[文本] ";
+    // 步骤1：处理私聊标记（仅用于显示）
+    QString realSender = isPrivate ? sender + "(私聊)" : sender;
+    
+    // 步骤2：判断是否是自己发送的消息（核心：决定气泡方向）
+    bool isSelf = false;
+    // 匹配规则：sender是自己的昵称，或包含自己昵称+私聊
+    if (sender == m_nickname || 
+        sender.startsWith(m_nickname + "(私聊)") || 
+        sender.startsWith(m_nickname + "(私聊→")) {
+        isSelf = true;
     }
-    
-    QString msg = QString("[%1] %2%3%4：%5")
-        .arg(QTime::currentTime().toString())
-        .arg(prefix)
-        .arg(typePrefix)
-        .arg(sender)
-        .arg(content);
-    
-    // 不同类型消息用不同颜色
-    if (typePrefix == "[图片] ") {
-        ui->textEdit_chatLog->setTextColor(Qt::blue);
-    } else if (typePrefix == "[文件] ") {
-        ui->textEdit_chatLog->setTextColor(Qt::green);
-    } else if (prefix == "[私聊] ") {
-        ui->textEdit_chatLog->setTextColor(Qt::red);
-    } else {
-        ui->textEdit_chatLog->setTextColor(Qt::black);
+    // 系统消息/别人消息：isSelf=false
+    else if (sender != "系统提示" && sender != "系统错误" && sender != "未知用户") {
+        isSelf = false;
     }
-    
-    ui->textEdit_chatLog->append(msg);
-    // 恢复默认颜色
-    ui->textEdit_chatLog->setTextColor(Qt::black);
+
+    // 步骤3：调用气泡消息函数（所有showMessage都变成气泡样式）
+    addMessage(realSender, content, isSelf);
 }
 
 // 获取在线用户
@@ -1605,5 +1591,76 @@ void ChatWindow::onRelayUdpReadyRead() {
                 showMessage("系统提示", QString("[中继] UDP图片已保存至：%1").arg(savePath));
             }
         }
+    }
+}
+
+// 生成气泡HTML（核心：微信风格气泡）
+QString ChatWindow::generateBubbleHtml(const QString& sender, const QString& content, bool isSelf) {
+    QString safeContent = content.toHtmlEscaped();
+    safeContent.replace("\n", "<br>");
+
+    // 区分消息类型（图片/文件/系统/文本）
+    QString contentStyle = "";
+    if (content.contains("[图片]") || content.contains(".jpg") || content.contains(".png")) {
+        // 图片消息：加图标+蓝色文字
+        safeContent = QString("<span style='color:#1677FF;'>📷 %1</span>").arg(safeContent);
+    } else if (content.contains("[文件]") || content.contains(".zip") || content.contains(".txt")) {
+        // 文件消息：加图标+绿色文字
+        safeContent = QString("<span style='color:#07C160;'>📎 %1</span>").arg(safeContent);
+    } else if (sender == "系统提示" || sender == "系统错误") {
+        // 系统消息：灰色文字
+        safeContent = QString("<span style='color:#888;'>ℹ️ %1</span>").arg(safeContent);
+    }
+
+    // 气泡样式（优化颜色和圆角，更贴近微信）
+    QString bubbleStyle = isSelf 
+        ? R"(
+            style='background:#07C160; color:white; border-radius:18px 18px 0 18px; 
+                   padding:10px 15px; margin:5px 0; max-width:70%; float:right;
+                   box-shadow: 0 1px 2px rgba(0,0,0,0.1);'
+        )" 
+        : R"(
+            style='background:white; color:#333; border-radius:18px 18px 18px 0; 
+                   padding:10px 15px; margin:5px 0; max-width:70%; float:left;
+                   box-shadow: 0 1px 2px rgba(0,0,0,0.1);'
+        )";
+
+    // 系统消息特殊样式（居中+浅灰色气泡）
+    if (sender == "系统提示" || sender == "系统错误") {
+        bubbleStyle = R"(
+            style='background:#F5F5F5; color:#888; border-radius:12px; 
+                   padding:8px 12px; margin:5px auto; max-width:60%; text-align:center;
+                   display:block; float:none;'
+        )";
+    }
+
+    return QString(R"(
+        <div style='width:100%; overflow:hidden; margin:8px 0;'>
+            <div %1>
+                <div style='font-size:12px; margin-bottom:4px; %2'>%3</div>
+                <div style='font-size:14px; line-height:1.5;'>%4</div>
+                <div style='font-size:10px; color:#ccc; margin-top:4px; text-align:right;'>%5</div>
+            </div>
+        </div>
+        <div style='clear:both;'></div>
+    )").arg(bubbleStyle)
+      .arg(isSelf ? "color:rgba(255,255,255,0.8);" : "color:#888;")
+      .arg(sender)
+      .arg(safeContent)
+      .arg(QTime::currentTime().toString("HH:mm")); // 追加消息时间
+}
+
+// 添加消息到聊天框
+void ChatWindow::addMessage(const QString& sender, const QString& content, bool isSelf) {
+    // 禁用滚动条自动跳转（避免插入HTML时滚动条乱跑）
+    QScrollBar* scrollBar = ui->textEdit_chatLog->verticalScrollBar();
+    bool isAtBottom = (scrollBar->value() == scrollBar->maximum());
+
+    // 追加气泡HTML
+    ui->textEdit_chatLog->append(generateBubbleHtml(sender, content, isSelf));
+
+    // 如果原本在底部，就自动滚动到底部
+    if (isAtBottom) {
+        scrollBar->setValue(scrollBar->maximum());
     }
 }
