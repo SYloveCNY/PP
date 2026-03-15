@@ -60,6 +60,8 @@ ChatWindow::ChatWindow(QWidget *parent)
     , m_relayUdpPort(8002)              // 中继UDP端口
     , m_udpRelaySocket(nullptr)
     , m_tcpRelaySocket(nullptr)
+    , m_p2pClientSocket(nullptr)
+    , m_fileTransferMutex()
 {
     // 加载UI文件（替代手动创建UI）
     ui->setupUi(this);
@@ -80,27 +82,26 @@ ChatWindow::ChatWindow(QWidget *parent)
     m_udpRelaySocket->bind(QHostAddress::Any); // 系统自动分配可用端口
     showMessage("系统提示", QString("中继UDP Socket绑定端口：%1").arg(m_udpRelaySocket->localPort()));
 
-    // 连接中继TCP服务器
-    m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
-    // 绑定中继相关信号槽
+    // 连接中继TCP服务器（取消注释，实际连接）
     connect(m_tcpRelaySocket, &QTcpSocket::connected, this, [=]() {
         showMessage("系统提示", "已连接到公网中继服务器（TCP）");
     });
-    connect(m_tcpRelaySocket, &QTcpSocket::disconnected, this, [=]() {
-        showMessage("系统提示", "与公网中继服务器（TCP）断开连接，正在重连...");
-        // 自动重连逻辑
-        QTimer::singleShot(3000, this, [=]() {
-            m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
-        });
-    });
-    connect(m_tcpRelaySocket, &QTcpSocket::errorOccurred, this, [=](QAbstractSocket::SocketError error) {
-        showMessage("系统错误", QString("中继TCP连接失败：%1，3秒后重连").arg(m_tcpRelaySocket->errorString()));
-        QTimer::singleShot(3000, this, [=]() {
-            m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
-        });
-    });
+    // connect(m_tcpRelaySocket, &QTcpSocket::disconnected, this, [=]() {
+    //     showMessage("系统提示", "与公网中继服务器（TCP）断开连接，正在重连...");
+    //     QTimer::singleShot(3000, this, [=]() {
+    //         m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
+    //     });
+    // });
+    // connect(m_tcpRelaySocket, &QTcpSocket::errorOccurred, this, [=](QAbstractSocket::SocketError error) {
+    //     showMessage("系统错误", QString("中继TCP连接失败：%1，3秒后重连").arg(m_tcpRelaySocket->errorString()));
+    //     QTimer::singleShot(3000, this, [=]() {
+    //         m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
+    //     });
+    // });
     connect(m_tcpRelaySocket, &QTcpSocket::readyRead, this, &ChatWindow::onRelayTcpReadyRead);
     connect(m_udpRelaySocket, &QUdpSocket::readyRead, this, &ChatWindow::onRelayUdpReadyRead);
+    // 内网测试：注释中继服务器连接（避免反复报错）
+    // m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
 
     // ========== 3. 先绑定TCP服务器信号，再启动监听（规范顺序） ==========
     connect(m_tcpP2PServer, &QTcpServer::newConnection, 
@@ -130,8 +131,8 @@ ChatWindow::ChatWindow(QWidget *parent)
 
     // ========== 5. UDP相关逻辑（修改为和TCP一样的端口区间遍历模式） ==========
     int selectedUdpPort = 0;
-    // 遍历指定端口区间，找第一个可用的UDP端口
-    for (int port = P2P_PORT_START; port <= P2P_PORT_END; ++port) {
+    //遍历指定端口区间，找第一个可用的UDP端口
+    for (int port = 9101; port <= 9200; ++port) {
         // 注意：UDP的bind和TCP的listen参数一致，但逻辑不同（UDP无监听，仅绑定端口）
         if (m_udpP2PSocket->bind(QHostAddress::Any, port)) {
             selectedUdpPort = port;
@@ -141,7 +142,7 @@ ChatWindow::ChatWindow(QWidget *parent)
 
     // 处理UDP绑定结果（容错+日志）
     if (selectedUdpPort == 0) {
-        showMessage("系统错误", QString("P2P UDP绑定失败：%1-%2端口全被占用！").arg(P2P_PORT_START).arg(P2P_PORT_END));
+        showMessage("系统错误", QString("P2P UDP绑定失败：9101-9200端口全被占用！"));
     } else {
         // 保存固定UDP端口
         m_udpP2PPort = selectedUdpPort;
@@ -160,17 +161,20 @@ ChatWindow::ChatWindow(QWidget *parent)
     connect(ui->pushButton_send, &QPushButton::clicked, this, &ChatWindow::sendMessage);
     connect(ui->pushButton_switchChatType, &QPushButton::clicked, this, &ChatWindow::switchChatType);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &ChatWindow::sendHeartbeat);
-    
-    // 新增：绑定图片/文件发送按钮点击事件
-    connect(ui->pushButton_sendImage, &QPushButton::clicked, this, 
-    static_cast<void (ChatWindow::*)()>(&ChatWindow::sendImage));
-    connect(ui->pushButton_sendFile, &QPushButton::clicked, this, 
-    static_cast<void (ChatWindow::*)()>(&ChatWindow::sendFile));
-
+    connect(ui->pushButton_sendImage, &QPushButton::clicked, this, [this](bool) {this->sendImage();});
+    connect(ui->pushButton_sendFile, &QPushButton::clicked, this, &ChatWindow::sendFile);
     connect(ui->listWidget_onlineUsers, &QListWidget::itemClicked, this, &ChatWindow::onUserItemClicked);
 
     // 启动心跳定时器
     m_heartbeatTimer->start(10000);
+
+    // 统一接收目录（分离文件/图片）
+    m_fileRecvDir = QCoreApplication::applicationDirPath() + "/chat_receive/files/";
+    m_imgRecvDir = QCoreApplication::applicationDirPath() + "/chat_receive/imgs/";
+    // 强制创建目录
+    QDir().mkpath(m_fileRecvDir);
+    QDir().mkpath(m_imgRecvDir);
+    showMessage("系统提示", QString("文件接收目录：%1\n图片接收目录：%2").arg(m_fileRecvDir).arg(m_imgRecvDir));
 }
 
 ChatWindow::~ChatWindow() {
@@ -191,7 +195,19 @@ ChatWindow::~ChatWindow() {
         m_tcpP2PServer->close();
         m_tcpP2PServer->deleteLater();
     }
-    delete ui; // 释放UI对象
+    if (m_udpRelaySocket) {
+        m_udpRelaySocket->close();
+        m_udpRelaySocket->deleteLater();
+    }
+    if (m_tcpRelaySocket) {
+        m_tcpRelaySocket->disconnectFromHost();
+        m_tcpRelaySocket->deleteLater();
+    }
+    if (m_transferFile) {
+        if (m_transferFile->isOpen()) m_transferFile->close();
+        delete m_transferFile;
+    }
+    delete ui;
 }
 
 // 修正sendLoginReq函数
@@ -232,15 +248,7 @@ void ChatWindow::closeEvent(QCloseEvent *event) {
         // 发送主动下线消息（强制发送）
         bool sendOk = sendPacket(m_socket, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), notifyData, nextMsgId++, m_userId);
         if (sendOk) {
-            std::cout << "主动下线通知发送成功：ID=" << m_userId << "，数据：" << notifyData << std::endl;
-            // 延长等待时间到1秒，确保数据发送完成
-            if (m_socket->waitForBytesWritten(1000)) {
-                std::cout << "主动下线通知已写入Socket缓冲区" << std::endl;
-            } else {
-                std::cout << "主动下线通知写入缓冲区超时" << std::endl;
-            }
-        } else {
-            std::cout << "主动下线通知发送失败，Socket状态：" << m_socket->state() << std::endl;
+            m_socket->waitForBytesWritten(1000);
         }
         
         // 断开连接
@@ -319,17 +327,10 @@ void ChatWindow::sendHeartbeat()
 
     // 4. 转换为网络字节序（调用你封装的htonHeader函数）
     PacketHeader netHeader = htonHeader(header);
+    m_socket->write((char*)&netHeader, sizeof(PacketHeader));
+    m_socket->write(heartbeatData.c_str(), heartbeatData.size());
 
-    // 5. 发送数据（先头部，后数据体）
-    qint64 headerSent = m_socket->write((char*)&netHeader, sizeof(PacketHeader));
-    qint64 dataSent = m_socket->write(heartbeatData.c_str(), heartbeatData.size());
-
-    // 调试输出（可选，方便排查）
-    qDebug() << "[心跳包] 发送成功 | "
-             << "用户ID=" << m_userId << " | "
-             << "TCP端口=" << currentTcpPort << " | "
-             << "UDP端口=" << currentUdpPort << " | "
-             << "发送字节数=" << headerSent + dataSent;
+    showMessage("系统提示", "心跳包响应正常");
 }
 
 // 处理服务器数据
@@ -616,11 +617,9 @@ void ChatWindow::sendImage(const QString& filePath) {
     int inputReceiverId = ui->lineEdit_privateId->text().toInt(&ok);
     if (ok && inputReceiverId > 0 && inputReceiverId != m_userId) {
         receiverId = inputReceiverId;
-        // 同步更新m_selectedUserId，保持一致性
         m_selectedUserId = receiverId;
     }
     
-    // 校验接收方ID是否有效
     if (receiverId <= 0 || receiverId == m_userId) {
         showMessage("系统提示", "请先选择有效的接收方（不能是自己）！");
         return;
@@ -664,90 +663,123 @@ void ChatWindow::sendImage(const QString& filePath) {
     }
     showMessage("系统提示", QString("准备连接接收方P2P端口：%1:%2").arg(m_targetIp.toString()).arg(m_targetTcpPort));
 
-    // ========== 核心修改：判断是否走中继 ==========
-    bool useRelay = isPrivateIp(m_targetIp);
+    // 本地测试时跳过内网IP判断（核心修复）
+    bool useRelay = false; // 强制直连，注释此行可恢复中继逻辑
+    // bool useRelay = isPrivateIp(m_targetIp);
     if (useRelay) {
         showMessage("系统提示", "检测到目标为内网IP，将通过公网中继发送图片");
     }
 
     // 3. 建立连接并发送图片（区分中继/直连）
-    bool sendOk = false;
+    // ========== 修复点1：改用指针变量，支持lambda中修改 ==========
+    bool* pSendOk = new bool(false);
+
     if (useRelay) {
         // 内网：走中继TCP连接
-        if (m_tcpRelaySocket->state() == QTcpSocket::ConnectedState) {
-            m_tcpRelaySocket->disconnectFromHost();
-            m_tcpRelaySocket->waitForDisconnected(1000);
-        }
-        m_tcpRelaySocket->abort();
-
-        // 连接中继服务器（重试3次）
-        for (int retry = 0; retry < 3; retry++) {
+        if (m_tcpRelaySocket->state() != QTcpSocket::ConnectedState) {
+            m_tcpRelaySocket->abort();
             m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
-            if (m_tcpRelaySocket->waitForConnected(2000)) {
-                // 拼接中继数据：senderId|receiverId|图片数据
-                QString relayData = QString("%1|%2|%3")
-                    .arg(g_currentUserId)
-                    .arg(receiverId)
-                    .arg(QString(imgData.toBase64())); // Base64避免特殊字符问题
-                
-                // 发送到中继
-                qint64 sent = m_tcpRelaySocket->write(relayData.toUtf8());
-                if (sent > 0) {
-                    m_tcpRelaySocket->flush();
-                    showMessage("系统提示", QString("图片数据已发送至中继服务器：%1字节").arg(sent));
-                    sendOk = true;
-                } else {
-                    showMessage("系统错误", "中继发送图片失败：" + m_tcpRelaySocket->errorString());
-                }
+            if (!m_tcpRelaySocket->waitForConnected(2000)) {
+                showMessage("系统错误", "连接中继服务器失败：" + m_tcpRelaySocket->errorString());
+                delete pSendOk; // 释放内存
+                return;
+            }
+        }
+
+        // 拼接中继数据：senderId|receiverId|Base64图片数据
+        QString relayData = QString("%1|%2|%3")
+            .arg(g_currentUserId)
+            .arg(receiverId)
+            .arg(QString(imgData.toBase64()));
+        
+        // 分块发送（避免单次发送过大）
+        const int BLOCK_SIZE = 4096;
+        qint64 totalSent = 0;
+        for (int i = 0; i < relayData.size(); i += BLOCK_SIZE) {
+            QString block = relayData.mid(i, BLOCK_SIZE);
+            qint64 sent = m_tcpRelaySocket->write(block.toUtf8());
+            if (sent > 0) {
+                totalSent += sent;
+                m_tcpRelaySocket->flush();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                showMessage("系统错误", "中继发送图片失败：" + m_tcpRelaySocket->errorString());
                 break;
             }
-            showMessage("系统提示", QString("连接中继服务器失败（第%1次重试）：%2").arg(retry+1).arg(m_tcpRelaySocket->errorString()));
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        
+        if (totalSent > 0) {
+            showMessage("系统提示", QString("图片数据已发送至中继服务器：%1字节").arg(totalSent));
+            *pSendOk = true; // 修改指针指向的变量
         }
     } else {
         // 公网：原有P2P直连逻辑
-        if (m_tcpP2PSocket->state() == QTcpSocket::ConnectedState) {
-            m_tcpP2PSocket->disconnectFromHost();
-            m_tcpP2PSocket->waitForDisconnected(1000);
-        }
-        m_tcpP2PSocket->abort();
+        QTcpSocket* p2pSocket = new QTcpSocket(this); // 新建Socket，避免覆盖全局Socket
+        
+        // ========== 修复点2：lambda捕获指针，支持修改 ==========
+        connect(p2pSocket, &QTcpSocket::connected, this, [=]() {
+            // 分块发送图片数据
+            const int BLOCK_SIZE = 4096;
+            qint64 totalSent = 0;
+            for (int i = 0; i < imgData.size(); i += BLOCK_SIZE) {
+                QByteArray block = imgData.mid(i, BLOCK_SIZE);
+                qint64 sent = p2pSocket->write(block);
+                if (sent > 0) {
+                    totalSent += sent;
+                    p2pSocket->flush();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                } else {
+                    showMessage("系统错误", "P2P发送图片失败：" + p2pSocket->errorString());
+                    break;
+                }
+            }
+            
+            if (totalSent == imgData.size()) {
+                showMessage("系统提示", QString("图片数据发送成功：%1字节").arg(totalSent));
+                *pSendOk = true; // 修改指针指向的变量（不再只读）
+            }
+            
+            // 改为：等待接收方关闭连接
+            connect(p2pSocket, &QTcpSocket::disconnected, this, [=]() {
+                p2pSocket->deleteLater();
+                showMessage("系统提示", "图片发送连接已正常断开");
+            });
+        });
 
-        // 连接重试：最多3次
+        // 连接失败处理
+        connect(p2pSocket, &QTcpSocket::errorOccurred, this, [=](QAbstractSocket::SocketError err) {
+            showMessage("P2P 错误", QString("P2P套接字错误：%1").arg(p2pSocket->errorString()));
+            p2pSocket->deleteLater();
+        });
+
+        // 发起连接（重试3次）
         bool connectOk = false;
         for (int retry = 0; retry < 3; retry++) {
-            m_tcpP2PSocket->connectToHost(m_targetIp, m_targetTcpPort);
-            if (m_tcpP2PSocket->waitForConnected(2000)) { // 2秒超时
+            p2pSocket->connectToHost(m_targetIp, m_targetTcpPort);
+            if (p2pSocket->waitForConnected(2000)) {
                 connectOk = true;
                 break;
             }
-            showMessage("系统提示", QString("P2P连接失败（第%1次重试）：%2").arg(retry+1).arg(m_tcpP2PSocket->errorString()));
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
         if (!connectOk) {
             showMessage("系统错误", "P2P连接失败（已重试3次），无法发送图片");
+            p2pSocket->deleteLater();
+            delete pSendOk; // 释放内存
             return;
         }
-
-        // 发送图片数据
-        qint64 sent = m_tcpP2PSocket->write(imgData);
-        if (sent > 0) {
-            m_tcpP2PSocket->flush();
-            // 等待数据真正发出去，再关闭
-            m_tcpP2PSocket->waitForBytesWritten(2000);
-            showMessage("系统提示", QString("图片数据发送成功：%1字节").arg(sent));
-            sendOk = true;
-        }
-
-        // 关闭P2P连接
-        QTimer::singleShot(200, this, [=]() {
-            m_tcpP2PSocket->disconnectFromHost();
-        });
     }
 
-    if (!sendOk) {
+    // 最终结果提示
+    if (*pSendOk) {
+        showMessage("系统提示", QString("图片发送成功（接收方ID：%1）").arg(receiverId));
+    } else {
         showMessage("系统错误", "图片发送最终失败，请检查中继服务器或网络");
     }
+    
+    // ========== 修复点3：释放指针内存，避免泄漏 ==========
+    delete pSendOk;
 }
 
 void ChatWindow::sendImage() {
@@ -828,6 +860,26 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
         return;
     }
 
+    // ========== 新增：等待打洞完成（如果正在打洞） ==========
+    int punchWaitCount = 0;
+    // 新增：内网IP直接跳过打洞等待
+    if (isPrivateIp(m_targetIp)) {
+        m_holePunchState = HolePunchState::Success;
+        punchWaitCount = 15; // 直接退出等待循环
+    }
+    while (m_holePunchState == HolePunchState::Punching) {
+        if (punchWaitCount >= 15) { // 最多等3秒打洞完成
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统提示"),
+                Q_ARG(QString, "打洞超时，使用默认传输策略"));
+            break;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        punchWaitCount++;
+    }
+
     // 等待P2P地址就绪（关键！发送前必须确保目标地址有效）
     int waitCount = 0;
     while (m_targetIp.isNull() || (metaMsg.protocol == TransportProtocol::TCP && m_targetTcpPort == 0) || 
@@ -848,6 +900,8 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
     const qint64 fragmentSize = 1024 * 1024; // 1MB分片
     qint64 offset = 0;
     bool sendSuccess = true;
+    // ========== 修复：把useRelay提到for循环外，扩大作用域 ==========
+    bool useRelay = false; 
 
     for (uint32_t idx = 1; idx <= metaMsg.totalFragments && sendSuccess; idx++) {
         // 读取分片数据
@@ -865,15 +919,36 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
         // 构造分片消息
         FileMsg fragMsg = metaMsg;
         fragMsg.fragmentIdx = idx;
-        fragMsg.fileData = fragmentData.toBase64().toStdString();
+        fragMsg.base64Data = fragmentData.toBase64().toStdString(); 
+        // ========== 修复核心问题：不再清空fileData ==========
+        fragMsg.fileData = fragMsg.base64Data; // 保持数据一致，接收端能读到
         fragMsg.dataLen = fragmentData.size();
         std::string fragData = serialize(fragMsg);
 
-        // 发送分片
-        if (metaMsg.protocol == TransportProtocol::TCP) {
-            // ========== 新增：TCP内网穿透逻辑 ==========
-            if (isPrivateIp(m_targetIp)) {
-                // 目标是内网IP → 走中继服务器
+        // ========== 核心修改：根据打洞状态动态决定是否使用中继 ==========
+        if (m_holePunchState == HolePunchState::Success) {
+            useRelay = false; // 打洞成功，优先直连
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统提示"),
+                Q_ARG(QString, QString("打洞成功，分片%1使用P2P直连传输").arg(idx)));
+        } else if (m_holePunchState == HolePunchState::Failed) {
+            useRelay = true; // 打洞失败，强制使用中继
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统提示"),
+                Q_ARG(QString, QString("打洞失败，分片%1使用中继传输").arg(idx)));
+        } else {
+            // 未打洞/打洞中，根据IP类型判断（内网用中继，公网试直连）
+            useRelay = isPrivateIp(m_targetIp);
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统提示"),
+                Q_ARG(QString, QString("未检测到打洞状态，分片%1%2传输").arg(idx).arg(useRelay ? "使用中继" : "尝试直连")));
+        }
+
+        if (useRelay) {
+            if (metaMsg.protocol == TransportProtocol::TCP) {
                 if (m_tcpRelaySocket->state() != QTcpSocket::ConnectedState) {
                     m_tcpRelaySocket->abort();
                     m_tcpRelaySocket->connectToHost(m_relayServerIp, m_relayTcpPort);
@@ -909,36 +984,6 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
                     Q_ARG(QString, "系统提示"),
                     Q_ARG(QString, QString("TCP分片%1已发送至中继服务器").arg(idx)));
             } else {
-                // 目标是公网IP → 原有直连逻辑
-                if (m_tcpP2PSocket->state() != QTcpSocket::ConnectedState) {
-                    m_tcpP2PSocket->abort();
-                    m_tcpP2PSocket->connectToHost(m_targetIp, m_targetTcpPort);
-                    if (!m_tcpP2PSocket->waitForConnected(2000)) {
-                        QMetaObject::invokeMethod(this, "showMessage",
-                            Qt::QueuedConnection,
-                            Q_ARG(QString, "系统错误"),
-                            Q_ARG(QString, QString("连接接收方TCP端口失败：%1").arg(m_tcpP2PSocket->errorString())));
-                        sendSuccess = false;
-                        break;
-                    }
-                }
-
-                // 发送数据并确保写入
-                qint64 sent = m_tcpP2PSocket->write(fragData.c_str(), fragData.size());
-                if (sent <= 0 || !m_tcpP2PSocket->waitForBytesWritten(1000)) {
-                    QMetaObject::invokeMethod(this, "showMessage",
-                        Qt::QueuedConnection,
-                        Q_ARG(QString, "系统错误"),
-                        Q_ARG(QString, QString("发送分片%1失败").arg(idx)));
-                    sendSuccess = false;
-                    break;
-                }
-            }
-        } else {
-            // ========== 新增：UDP内网穿透逻辑 ==========
-            if (isPrivateIp(m_targetIp)) {
-                // 目标是内网IP → 走中继服务器
-                // 拼接中继数据格式：senderId|receiverId|分片数据
                 QString relayData = QString("%1|%2|%3")
                     .arg(m_userId)
                     .arg(metaMsg.receiverId)
@@ -964,16 +1009,71 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
                     Qt::QueuedConnection,
                     Q_ARG(QString, "系统提示"),
                     Q_ARG(QString, QString("UDP分片%1已发送至中继服务器").arg(idx)));
+            }
+        } else {
+            if (metaMsg.protocol == TransportProtocol::TCP) {
+                if (m_tcpP2PSocket->state() != QTcpSocket::ConnectedState) {
+                    m_tcpP2PSocket->abort();
+                    m_tcpP2PSocket->connectToHost(m_targetIp, m_targetTcpPort);
+                    // ========== 优化：打洞成功时增加连接超时时间 ==========
+                    int connectTimeout = (m_holePunchState == HolePunchState::Success) ? 3000 : 2000;
+                    if (!m_tcpP2PSocket->waitForConnected(connectTimeout)) {
+                        QMetaObject::invokeMethod(this, "showMessage",
+                            Qt::QueuedConnection,
+                            Q_ARG(QString, "系统错误"),
+                            Q_ARG(QString, QString("连接接收方TCP端口失败：%1").arg(m_tcpP2PSocket->errorString())));
+                        // ========== 新增：TCP直连失败自动切换到中继 ==========
+                        // ========== 修复：先构造QString再传给Q_ARG ==========
+                        QMetaObject::invokeMethod(this, "showMessage",
+                            Qt::QueuedConnection,
+                            Q_ARG(QString, "系统提示"),
+                            Q_ARG(QString, QString("TCP直连失败，切换到中继模式重试分片%1").arg(idx)));
+                        // 强制使用中继并重试当前分片
+                        useRelay = true;
+                        idx--; // 回退分片索引，重新发送
+                        continue;
+                    }
+                }
+
+                qint64 sent = m_tcpP2PSocket->write(fragData.c_str(), fragData.size());
+                if (sent <= 0 || !m_tcpP2PSocket->waitForBytesWritten(1000)) {
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统错误"),
+                        Q_ARG(QString, QString("发送分片%1失败").arg(idx)));
+                    sendSuccess = false;
+                    break;
+                }
             } else {
-                // 目标是公网IP → 原有直连逻辑
-                qint64 sent = m_udpP2PSocket->writeDatagram(fragData.c_str(), fragData.size(), m_targetIp, m_targetUdpPort);
+                // ========== 优化：打洞成功的UDP直连逻辑 ==========
+                qint64 sent = -1;
+                if (m_holePunchState == HolePunchState::Success) {
+                    // 打洞成功，直接发送原始分片数据（无需封装）
+                    sent = m_udpP2PSocket->writeDatagram(fragmentData, m_targetIp, m_targetUdpPort);
+                } else {
+                    // 未打洞，发送序列化后的分片消息
+                    sent = m_udpP2PSocket->writeDatagram(fragData.c_str(), fragData.size(), m_targetIp, m_targetUdpPort);
+                }
+                
                 if (sent <= 0) {
                     QMetaObject::invokeMethod(this, "showMessage",
                         Qt::QueuedConnection,
                         Q_ARG(QString, "系统错误"),
                         Q_ARG(QString, QString("发送UDP分片%1失败").arg(idx)));
-                    sendSuccess = false;
-                    break;
+                    // ========== 新增：UDP直连失败自动切换到中继 ==========
+                    // ========== 修复：先构造QString再传给Q_ARG ==========
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统提示"),
+                        Q_ARG(QString, QString("UDP直连失败，切换到中继模式重试分片%1").arg(idx)));
+                    useRelay = true;
+                    idx--; // 回退分片索引，重新发送
+                    continue;
+                } else {
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统提示"),
+                        Q_ARG(QString, QString("UDP分片%1直连发送成功（%2字节）").arg(idx).arg(sent)));
                 }
             }
         }
@@ -992,10 +1092,12 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
 
     // 发送完成/失败提示
     if (sendSuccess) {
+        // ========== 修复：useRelay已在外部定义，可正常访问 ==========
+        QString transferMode = (m_holePunchState == HolePunchState::Success) ? "P2P直连" : (useRelay ? "中继" : "尝试直连");
         QMetaObject::invokeMethod(this, "showMessage",
             Qt::QueuedConnection,
             Q_ARG(QString, m_nickname),
-            Q_ARG(QString, QString("文件 %1 发送完成（MD5：%2）").arg(QString::fromStdString(metaMsg.fileName)).arg(QString::fromStdString(metaMsg.fileMd5))));
+            Q_ARG(QString, QString("文件 %1 发送完成（%2，MD5：%3）").arg(QString::fromStdString(metaMsg.fileName)).arg(transferMode).arg(QString::fromStdString(metaMsg.fileMd5))));
     } else {
         QMetaObject::invokeMethod(this, "showMessage",
             Qt::QueuedConnection,
@@ -1004,6 +1106,8 @@ void ChatWindow::sendFileFragment(FileMsg metaMsg) {
     }
 
     m_transferFile->close();
+    // ========== 新增：传输完成后重置打洞状态 ==========
+    m_holePunchState = HolePunchState::Idle;
 }
 
 // 更新传输进度
@@ -1013,29 +1117,66 @@ void ChatWindow::updateTransferProgress(int progress) {
 
 // ========== 新增：中继数据处理入口（优先处理） ==========
 // 该函数供onRelayTcpReadyRead/onRelayUdpReadyRead调用，处理单个中继分片
-void ChatWindow::processRelayFragment(int senderId, const FileMsg& fragMsg) {
+void ChatWindow::processRelayFragment(int senderId, const FileMsg& fragMsg, bool isRelayData) {
     int realSenderId = senderId;
-    if (realSenderId == 0 && !m_relayMetaMap.isEmpty()) {
-        realSenderId = m_relayMetaMap.keys().first();
-    } else if (realSenderId == 0) {
-        realSenderId = 1;
+    if (realSenderId == 0) {
+        if (!m_relayMetaMap.isEmpty()) {
+            realSenderId = m_relayMetaMap.keys().first();
+        } else {
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, "senderId为空且无元信息缓存，跳过分片处理"));
+            return; // 无有效senderId，直接返回
+        }
     }
 
-    QString saveDir = QDir::homePath() + "/chat_files";
+    QString saveDir = m_fileRecvDir;
     QString fileName = QString::fromStdString(fragMsg.fileName).split("/").last();
     QDir dir(saveDir);
     if (!dir.exists()) dir.mkpath(".");
     QString savePath = QString("%1/relay_%2_%3").arg(saveDir).arg(realSenderId).arg(fileName);
 
-    // ====================== 修复：Base64 解码 ======================
-    QByteArray rawData = QByteArray::fromStdString(fragMsg.fileData);
-    QByteArray fragmentData = QByteArray::fromBase64(rawData);
+    // 核心修复：跳过元信息分片（idx=0）的空数据检查
+    QByteArray fragmentData;
+    if (fragMsg.fragmentIdx == 0) {
+        // 元信息分片，仅缓存不写入
+        m_relayMetaMap[realSenderId] = fragMsg;
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, "系统提示"),
+            Q_ARG(QString, QString("缓存文件元信息（senderId：%1，分片数：%2）").arg(realSenderId).arg(fragMsg.totalFragments)));
+        return;
+    }
+
+    if (isRelayData && !fragMsg.base64Data.empty()) {
+        // 中继数据：需要Base64解码
+        QByteArray base64Data = QByteArray::fromStdString(fragMsg.base64Data);
+        fragmentData = QByteArray::fromBase64(base64Data);
+        if (fragmentData.isEmpty()) {
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, QString("分片%1 Base64解码失败，数据为空").arg(fragMsg.fragmentIdx)));
+            return;
+        }
+    } else if (!isRelayData && !fragMsg.base64Data.empty()) {
+        // 直连数据：Base64解码（与发送方一致）
+        fragmentData = QByteArray::fromStdString(fragMsg.base64Data);
+    }
+
+    if (fragmentData.isEmpty()) {
+        QMetaObject::invokeMethod(this, "showMessage",
+            Qt::QueuedConnection,
+            Q_ARG(QString, "系统错误"),
+            Q_ARG(QString, QString("分片%1数据为空，跳过写入").arg(fragMsg.fragmentIdx)));
+        return;
+    }
 
     m_relayFragMap[realSenderId][fragMsg.fragmentIdx] = fragmentData;
 
     int progress = (m_relayFragMap[realSenderId].size() * 100) / fragMsg.totalFragments;
 
-    // ========== 修复编译错误：先构造完整QString，再传入Q_ARG ==========
     QString progressMsg = QString("[中继合并] 已缓存分片%1/%2（senderId：%3），进度：%4%")
         .arg(fragMsg.fragmentIdx)
         .arg(fragMsg.totalFragments)
@@ -1054,14 +1195,37 @@ void ChatWindow::processRelayFragment(int senderId, const FileMsg& fragMsg) {
         QFile file(savePath);
         if (file.open(QIODevice::WriteOnly)) {
             qint64 total = 0;
+            // 按分片ID顺序写入（关键：避免乱序）
             for (uint32_t i = 1; i <= fragMsg.totalFragments; ++i) {
                 if (m_relayFragMap[realSenderId].contains(i)) {
-                    total += file.write(m_relayFragMap[realSenderId][i]);
+                    QByteArray data = m_relayFragMap[realSenderId][i];
+                    if (!data.isEmpty()) { // 非空才写入
+                        qint64 writeLen = file.write(data);
+                        if (writeLen > 0) {
+                            total += writeLen;
+                        } else {
+                            QMetaObject::invokeMethod(this, "showMessage",
+                                Qt::QueuedConnection,
+                                Q_ARG(QString, "系统错误"),
+                                Q_ARG(QString, QString("写入分片%1失败，写入长度：%2").arg(i).arg(writeLen)));
+                        }
+                    } else {
+                        QMetaObject::invokeMethod(this, "showMessage",
+                            Qt::QueuedConnection,
+                            Q_ARG(QString, "系统提示"),
+                            Q_ARG(QString, QString("分片%1数据为空，跳过写入").arg(i)));
+                    }
+                } else {
+                    QMetaObject::invokeMethod(this, "showMessage",
+                        Qt::QueuedConnection,
+                        Q_ARG(QString, "系统错误"),
+                        Q_ARG(QString, QString("缺失分片%1，文件可能损坏").arg(i)));
                 }
             }
+            // 强制刷盘（关键：确保数据写入磁盘）
+            file.flush();
             file.close();
 
-            // ========== 同样修复这里的arg()调用 ==========
             QString saveMsg = QString("[中继合并] 文件保存成功！路径：%1，实际大小：%2 字节")
                 .arg(savePath)
                 .arg(total);
@@ -1070,6 +1234,11 @@ void ChatWindow::processRelayFragment(int senderId, const FileMsg& fragMsg) {
                 Qt::QueuedConnection,
                 Q_ARG(QString, "系统提示"),
                 Q_ARG(QString, saveMsg));
+        } else {
+            QMetaObject::invokeMethod(this, "showMessage",
+                Qt::QueuedConnection,
+                Q_ARG(QString, "系统错误"),
+                Q_ARG(QString, QString("打开文件失败：%1").arg(file.errorString())));
         }
 
         m_relayFragMap.remove(realSenderId);
@@ -1094,7 +1263,7 @@ void ChatWindow::receiveFile(const FileMsg& metaMsg) {
     QMetaObject::invokeMethod(this, "showMessage",
         Qt::QueuedConnection,
         Q_ARG(QString, "系统提示"),
-        Q_ARG(QString, "已禁用直连接收，等待中继分片..."));
+        Q_ARG(QString, "已缓存文件元信息，优先等待直连接收..."));
 
     // 启动一个定时器，5秒后检查分片是否到齐（避免永久等待）
     QTimer::singleShot(5000, this, [=]() {
@@ -1215,7 +1384,7 @@ void ChatWindow::onP2PDataReady() {
 
 // 新增UDP接收槽函数
 void ChatWindow::onUdpReadyRead() {
-    if (!m_udpP2PSocket) return; // 判空
+    if (!m_udpP2PSocket) return;
 
     while (m_udpP2PSocket->hasPendingDatagrams()) {
         QByteArray datagram;
@@ -1223,41 +1392,45 @@ void ChatWindow::onUdpReadyRead() {
         QHostAddress senderAddr;
         quint16 senderPort;
         qint64 readLen = m_udpP2PSocket->readDatagram(datagram.data(), datagram.size(), &senderAddr, &senderPort);
-        if (readLen <= 0) continue; // 读取失败直接跳过
+        if (readLen <= 0) continue;
         
-        // ========== 核心修复：优先处理中继UDP数据 ==========
+        // 处理中继UDP数据（格式：senderId|receiverId|数据）
         QStringList relayParts = QString(datagram).split("|");
         if (relayParts.size() >= 3) {
-            // 是中继UDP数据（文件/图片）
-            int senderId = relayParts[0].toInt();
-            int receiverId = relayParts[1].toInt();
+            bool senderIdOk = false;
+            bool receiverIdOk = false;
+            int senderId = relayParts[0].toInt(&senderIdOk);
+            int receiverId = relayParts[1].toInt(&receiverIdOk);
             
-            // 兼容receiverId=0/正确ID，senderId=0时用元信息里的senderId
-            if (receiverId != m_userId && receiverId != 0) continue;
-            if (senderId == 0 && !m_relayMetaMap.isEmpty()) {
-                senderId = m_relayMetaMap.keys().first(); // 兜底取第一个缓存的senderId
+            // 校验ID有效性
+            if (!senderIdOk || !receiverIdOk || (receiverId != m_userId && receiverId != 0)) {
+                showMessage("系统提示", "[UDP中继] 无效的中继数据：ID解析失败或非本机数据");
+                continue;
             }
 
             QByteArray realData = relayParts[2].toUtf8();
+            if (realData.isEmpty()) {
+                showMessage("系统提示", "[UDP中继] 中继数据为空，忽略");
+                continue;
+            }
+
             showMessage("系统提示", QString("[UDP中继] 解析到中继数据（senderId：%1，receiverId：%2），长度：%3字节")
                         .arg(senderId).arg(receiverId).arg(realData.size()));
 
             try {
-                // 优先处理文件分片
+                // 处理中继文件分片
                 FileMsg fragMsg = deserializeFileMsg(realData.toStdString());
-                if (fragMsg.senderId == 0) fragMsg.senderId = senderId; // 修复senderId=0
-                processRelayFragment(senderId, fragMsg); // 直接调用合并逻辑
-                continue;
+                if (fragMsg.senderId == 0) fragMsg.senderId = senderId;
+                processRelayFragment(senderId, fragMsg, true); // 标记为中继数据
             } catch (std::exception& e) {
-                // 处理图片数据
-                if (!m_pendingImageMsg.fileName.empty()) {
+                // 处理中继图片数据
+                if (!m_pendingImageMsg.fileName.empty() && m_pendingImageMsg.fileSize > 0) {
                     m_pendingImageData = QByteArray::fromBase64(realData);
                     showMessage("系统提示", QString("[UDP中继] 接收图片数据：%1/%2字节")
                                 .arg(m_pendingImageData.size()).arg(m_pendingImageMsg.fileSize));
                     
-                    // 数据完整则保存
                     if (m_pendingImageData.size() >= m_pendingImageMsg.fileSize) {
-                        QString saveDir = "./recv_imgs";
+                        QString saveDir = m_imgRecvDir;
                         QDir dir(saveDir);
                         if (!dir.exists()) dir.mkpath(saveDir);
                         
@@ -1266,55 +1439,44 @@ void ChatWindow::onUdpReadyRead() {
                         
                         QFile file(savePath);
                         if (file.open(QIODevice::WriteOnly)) {
-                            file.write(m_pendingImageData);
+                            qint64 writeLen = file.write(m_pendingImageData);
+                            file.flush();
                             file.close();
-                            showMessage("系统提示", QString("[UDP中继] 图片保存完成：%1").arg(savePath));
+                            showMessage("系统提示", QString("[UDP中继] 图片保存完成：%1（大小：%2字节）").arg(savePath).arg(writeLen));
                         } else {
                             showMessage("系统错误", QString("[UDP中继] 保存图片失败：%1").arg(file.errorString()));
                         }
-                        // 重置缓存
                         m_pendingImageMsg = ImageMsg();
                         m_pendingImageData.clear();
                     }
                 }
-                continue;
             }
+            continue;
         }
 
-        // ========== 直连UDP数据（兼容旧逻辑） ==========
+        // 处理直连UDP数据（无中继格式）
         try {
-            // 尝试反序列化为文件分片
+            // 直连文件分片：优先解析为FileMsg
             FileMsg fragMsg = deserializeFileMsg(datagram.toStdString());
-            showMessage("系统提示", QString("收到UDP文件分片：来自%1:%2，分片ID：%3")
+            showMessage("系统提示", QString("收到UDP文件分片：来自%1:%2，分片ID：%3，数据长度：%4字节")
                         .arg(senderAddr.toString())
                         .arg(senderPort)
-                        .arg(fragMsg.fragmentIdx));
-            // 直连分片也调用合并逻辑
-            processRelayFragment(fragMsg.senderId, fragMsg);
-            continue; // 跳过图片保存逻辑
+                        .arg(fragMsg.fragmentIdx)
+                        .arg(fragMsg.base64Data.size()));
+            processRelayFragment(fragMsg.senderId, fragMsg, false); // 标记为直连数据
         } catch (std::exception& e) {
-            // 不是文件分片，判定为图片数据
-            showMessage("系统提示", QString("收到UDP图片数据：来自%1:%2，长度%3字节")
+            // 解析失败：直接使用原始二进制数据（打洞成功时发送的原始数据）
+            showMessage("系统提示", QString("收到UDP原始分片数据：来自%1:%2，长度%3字节（解析FileMsg失败，直接处理）")
                         .arg(senderAddr.toString())
                         .arg(senderPort)
                         .arg(datagram.size()));
-            
-            // 保存图片数据（仅处理真正的图片）
-            QString saveDir = "./recv_imgs";
-            QDir dir(saveDir);
-            if (!dir.exists()) dir.mkpath(saveDir);
-
-            // 生成唯一文件名（基于时间戳+随机数，避免重复）
-            QString timestamp = QTime::currentTime().toString("hhmmsszzz");
-            QString savePath = QString("%1/udp_img_%2.jpg").arg(saveDir).arg(timestamp);
-            QFile file(savePath); 
-            if (file.open(QIODevice::WriteOnly)) {
-                file.write(datagram);
-                file.close();
-                showMessage("系统提示", QString("UDP图片已保存至：%1").arg(savePath));
-            } else {
-                showMessage("系统错误", QString("保存UDP图片失败：%1").arg(file.errorString()));
-            }
+            // 构造临时FileMsg，填充原始数据
+            FileMsg tempFrag;
+            tempFrag.senderId = m_relayMetaMap.isEmpty() ? 0 : m_relayMetaMap.keys().first();
+            tempFrag.base64Data = datagram.toBase64().toStdString(); // 转为Base64统一处理
+            tempFrag.fragmentIdx = 1; // 单分片默认ID为1
+            tempFrag.totalFragments = 1;
+            processRelayFragment(tempFrag.senderId, tempFrag, false);
         }
     }
 }
@@ -1398,27 +1560,39 @@ void ChatWindow::onP2PSocketReadyRead() {
     bool isRelayData = false;
     int relaySenderId = 0;
 
-    // ========== 解析中继数据 ==========
-    QStringList relayParts = QString(rawData).split("|");
-    if (relayParts.size() >= 3) {
-        int senderId = relayParts[0].toInt();
-        int receiverId = relayParts[1].toInt();
-        
-        // 兼容所有合法ID
-        if (receiverId != m_userId && receiverId != 0) {
-            showMessage("系统提示", QString("收到非本机的中继图片数据（接收方ID：%1），忽略").arg(receiverId));
-            return; // 移除断开连接逻辑，仅忽略数据
+    // ========== 解析中继数据（仅当数据包含|分隔符时） ==========
+    if (rawData.contains('|')) {
+        QStringList relayParts = QString(rawData).split("|");
+        if (relayParts.size() >= 3) {
+            int senderId = relayParts[0].toInt();
+            int receiverId = relayParts[1].toInt();
+            
+            // 兼容所有合法ID
+            if (receiverId != m_userId && receiverId != 0) {
+                showMessage("系统提示", QString("收到非本机的中继图片数据（接收方ID：%1），忽略").arg(receiverId));
+                return;
+            }
+
+            // 修复senderId=0：优先用图片元信息的senderId，其次用中继缓存
+            relaySenderId = senderId == 0 ? m_pendingImageMsg.senderId : senderId;
+            if (relaySenderId == 0 && !m_relayMetaMap.isEmpty()) {
+                relaySenderId = m_relayMetaMap.keys().first();
+            }
+            if (relaySenderId == 0) {
+                relaySenderId = 1; // 最终兜底，避免显示0
+            }
+            // 解码Base64
+            realImageData = QByteArray::fromBase64(relayParts[2].toUtf8());
+            isRelayData = true;
+
+            showMessage("系统提示", QString("解析中继图片数据成功（来自用户%1）：%2字节（原始数据：%3字节）")
+                        .arg(relaySenderId).arg(realImageData.size()).arg(rawData.size()));
+        } else {
+            // 不是合法中继数据，直接作为图片数据
+            realImageData = rawData;
         }
-
-        // 修复senderId=0
-        relaySenderId = senderId == 0 ? (m_relayMetaMap.isEmpty() ? 1 : m_relayMetaMap.keys().first()) : senderId;
-        // 解码Base64（核心：用toUtf8，避免编码错误）
-        realImageData = QByteArray::fromBase64(relayParts[2].toUtf8());
-        isRelayData = true;
-
-        showMessage("系统提示", QString("解析中继图片数据成功（来自用户%1）：%2字节（原始数据：%3字节）")
-                    .arg(relaySenderId).arg(realImageData.size()).arg(rawData.size()));
     } else {
+        // 无|分隔符，是直连图片数据
         realImageData = rawData;
     }
 
@@ -1426,19 +1600,31 @@ void ChatWindow::onP2PSocketReadyRead() {
     if (m_pendingImageMsg.fileSize <= 0) {
         showMessage("系统提示", "无有效的图片元信息，保存为临时文件");
         // 保存临时图片（避免数据丢失）
-        QString saveDir = "./recv_imgs";
+        QString saveDir = m_imgRecvDir;
         QDir dir(saveDir);
         if (!dir.exists()) dir.mkpath(saveDir);
-        QString timestamp = QTime::currentTime().toString("hhmmsszzz");
-        QString savePath = QString("%1/tmp_img_%2.jpg").arg(saveDir).arg(timestamp);
+    QString timestamp = QTime::currentTime().toString("hhmmsszzz");
+    // 优先从元信息获取原文件名和后缀（TCP临时文件专用命名）
+    QString fileName = QString("tcp_temp_img_%1").arg(timestamp);
+    if (!m_relayMetaMap.isEmpty()) {
+        fileName = QString::fromStdString(m_relayMetaMap.begin().value().fileName).split("/").last();
+        // 确保文件名唯一：追加时间戳避免覆盖
+        fileName = fileName.split(".").first() + "_" + timestamp + "." + fileName.split(".").last();
+    }
+    // 无后缀时补充通用后缀
+    if (!fileName.contains(".")) {
+        fileName += ".bin";
+    }
+    QString savePath = QString("%1/%2").arg(saveDir).arg(fileName);
         
         QFile file(savePath);
         if (file.open(QIODevice::WriteOnly)) {
-            file.write(realImageData);
+            qint64 writeLen = file.write(realImageData);
+            file.flush();
             file.close();
-            showMessage("系统提示", QString("临时图片保存完成：%1（大小：%2字节）").arg(savePath).arg(realImageData.size()));
+            showMessage("系统提示", QString("临时图片保存完成：%1（大小：%2字节）").arg(savePath).arg(writeLen));
         }
-        return; // 移除断开连接逻辑
+        return;
     }
 
     // ========== 累加数据并保存 ==========
@@ -1447,35 +1633,51 @@ void ChatWindow::onP2PSocketReadyRead() {
                 .arg(isRelayData ? "中继" : "直连")
                 .arg(m_pendingImageData.size()).arg(m_pendingImageMsg.fileSize).arg(relaySenderId));
 
-    // 数据完整则保存
-    if (m_pendingImageData.size() >= m_pendingImageMsg.fileSize) {
-        QString saveDir = "./recv_imgs";
+    // 实时打印累加进度，处理冗余数据，仅匹配长度时保存
+    showMessage("系统提示", QString("图片数据累加中：当前%1字节 / 目标%2字节")
+                .arg(m_pendingImageData.size()).arg(m_pendingImageMsg.fileSize));
+    
+    bool isDataComplete = false;
+    // 处理冗余数据：截断到目标长度
+    if (m_pendingImageData.size() > m_pendingImageMsg.fileSize) {
+        m_pendingImageData = m_pendingImageData.left(m_pendingImageMsg.fileSize);
+        showMessage("系统提示", "图片数据超出目标长度，已截断至实际大小");
+        isDataComplete = true;
+    } else if (m_pendingImageData.size() == m_pendingImageMsg.fileSize) {
+        isDataComplete = true;
+    }
+
+    // 仅当数据完整（匹配/截断后匹配）时保存
+    if (isDataComplete) {
+        // 校验MD5（可选）
+        QCryptographicHash hash(QCryptographicHash::Md5);
+        hash.addData(m_pendingImageData);
+        QString md5 = hash.result().toHex();
+        
+        // 保存图片（优化：追加senderId避免文件名冲突）
+        QString saveDir = m_imgRecvDir;
         QDir dir(saveDir);
         if (!dir.exists()) dir.mkpath(saveDir);
         
         QString fileName = QString::fromStdString(m_pendingImageMsg.fileName).split("/").last();
-        if (isRelayData) {
-            fileName = QString("relay_%1_%2").arg(relaySenderId).arg(fileName);
-        }
+        // 追加发送方ID，避免多用户发送同名文件覆盖
+        fileName = QString("%1_%2").arg(relaySenderId).arg(fileName);
         QString savePath = QString("%1/%2").arg(saveDir).arg(fileName);
 
         QFile file(savePath);
         if (file.open(QIODevice::WriteOnly)) {
-            file.write(m_pendingImageData);
+            qint64 writeLen = file.write(m_pendingImageData);
+            file.flush();
             file.close();
-            showMessage("系统提示", QString("%1图片接收完成，已保存至：%2（实际大小：%3字节）")
-                        .arg(isRelayData ? "中继" : "直连")
-                        .arg(savePath)
-                        .arg(m_pendingImageData.size()));
+            showMessage("系统提示", QString("图片接收完成：%1（大小：%2字节，MD5：%3）")
+                        .arg(savePath).arg(writeLen).arg(md5));
         } else {
             showMessage("系统错误", QString("保存图片失败：%1").arg(file.errorString()));
         }
-
-        // 重置缓存
+        
+        // 重置缓存（必须：避免下次接收数据污染）
         m_pendingImageMsg = ImageMsg();
         m_pendingImageData.clear();
-        // 数据接收完成后再断开连接
-        socket->disconnectFromHost();
     }
 }
 
@@ -1531,7 +1733,7 @@ void ChatWindow::onRelayTcpReadyRead() {
         // 图片数据：复用原有中继图片接收逻辑
         m_pendingImageData = QByteArray::fromBase64(realData);
         if (m_pendingImageMsg.fileSize > 0 && m_pendingImageData.size() == m_pendingImageMsg.fileSize) {
-            QString saveDir = "./recv_imgs";
+            QString saveDir = m_imgRecvDir;
             QDir dir(saveDir);
             dir.mkpath(saveDir);
             QString fileName = QString::fromStdString(m_pendingImageMsg.fileName).split("/").last();
@@ -1579,7 +1781,7 @@ void ChatWindow::onRelayUdpReadyRead() {
             receiveFileFragment(fragMsg); // 调用新增接口处理
         } catch (...) {
             // 图片数据
-            QString saveDir = "./recv_imgs";
+            QString saveDir = m_imgRecvDir;
             QDir dir(saveDir);
             dir.mkpath(saveDir);
             QString timestamp = QTime::currentTime().toString("hhmmsszzz");

@@ -29,6 +29,14 @@ class QTextEdit;
 class QLineEdit;
 class QPushButton;
 
+enum class HolePunchState {
+    Idle,           // 空闲状态
+    WaitingForAddr, // 等待对方地址
+    Punching,       // 正在打洞
+    Success,        // 打洞成功
+    Failed          // 打洞失败
+};
+
 class ChatWindow : public QWidget
 {
     Q_OBJECT
@@ -91,7 +99,7 @@ private:
     // 接收中继文件分片
     void receiveFileFragment(const FileMsg& fragMsg);
     // 处理中继分片数据
-    void processRelayFragment(int senderId, const FileMsg& fragMsg);
+    void processRelayFragment(int senderId, const FileMsg& fragMsg, bool isRelayData = false);
     // 处理上线/下线通知
     void processNotification(const MsgType &type, const std::string &data); 
     // 更新用户列表
@@ -140,6 +148,27 @@ private:
     // 中继分片缓存（静态成员，全局共享）
     QMap<int, QMap<uint32_t, QByteArray>> m_relayFragMap; // 中继分片缓存
     QMap<int, FileMsg> m_relayMetaMap;                    // 中继文件元信息缓存
+    QString m_fileRecvDir;  // 文件统一接收目录
+    QString m_imgRecvDir;   // 图片统一接收目录
+    // UDP打洞相关
+    HolePunchState m_holePunchState = HolePunchState::Idle;
+    QTimer* m_holePunchTimer = nullptr;
+    int m_holePunchRetryCount = 0;
+    static const int MAX_HOLE_PUNCH_RETRIES = 5;
+
+    // 打洞用的UDP包（标识用）
+    struct HolePunchPacket {
+        int senderId;
+        int type; // 0: 打洞包, 1: 确认包
+    };
+
+    // UDP打洞方法
+    void startHolePunching(int targetUserId);
+    void sendHolePunchPacket();
+    void onHolePunchTimeout();
+    void handleHolePunchResponse(const QByteArray& data, const QHostAddress& sender, quint16 port);
+    void switchToDirectConnection();
+    void switchToRelayConnection();
 };
 
 #endif // CHATWINDOW_H
