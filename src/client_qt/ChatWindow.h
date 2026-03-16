@@ -99,7 +99,7 @@ private:
     // 接收中继文件分片
     void receiveFileFragment(const FileMsg& fragMsg);
     // 处理中继分片数据
-    void processRelayFragment(int senderId, const FileMsg& fragMsg, bool isRelayData = false);
+    void processRelayFragment(int senderId, const FileMsg& fragMsg, bool isRelayData = false, bool isBase64 = true);
     // 处理上线/下线通知
     void processNotification(const MsgType &type, const std::string &data); 
     // 更新用户列表
@@ -113,6 +113,8 @@ private:
     void addMessage(const QString& sender, const QString& content, bool isSelf = false);
     // 生成气泡HTML
     QString generateBubbleHtml(const QString& sender, const QString& content, bool isSelf);
+    // 辅助函数
+    void saveCompleteImage(int relaySenderId); 
       
 private:
     // 成员变量
@@ -155,6 +157,7 @@ private:
     QTimer* m_holePunchTimer = nullptr;
     int m_holePunchRetryCount = 0;
     static const int MAX_HOLE_PUNCH_RETRIES = 5;
+    QTimer* m_imgRecvTimeoutTimer; // 图片接收超时定时器
 
     // 打洞用的UDP包（标识用）
     struct HolePunchPacket {
