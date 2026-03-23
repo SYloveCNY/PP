@@ -7,13 +7,14 @@
     <x>0</x>
     <y>0</y>
     <width>400</width>
-    <height>300</height>
+    <height>350</height> <!-- 加高窗口容纳头像区域 -->
    </rect>
   </property>
   <property name="windowTitle">
    <string>登录</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
+   <!-- 昵称输入区域（原有） -->
    <item>
     <widget class="QLabel" name="label">
      <property name="text">
@@ -24,16 +25,53 @@
    <item>
     <widget class="QLineEdit" name="lineEdit_nickname"/>
    </item>
+   
+   <!-- 新增：头像选择区域 -->
    <item>
-    <widget class="QLabel" name="label_2">
+    <widget class="QLabel" name="label_avatar">
      <property name="text">
-      <string>头像路径（可选）</string>
+      <string>选择头像</string>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="QLineEdit" name="lineEdit_avatar"/>
+    <layout class="QHBoxLayout" name="avatarLayout">
+     <item>
+      <widget class="QPushButton" name="pushButton_select_avatar">
+       <property name="text">
+        <string>选择图片</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="label_avatar_preview">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>100</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>100</width>
+         <height>100</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string>border: 1px solid #cccccc;</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignCenter</set>
+       </property>
+       <property name="text">
+        <string>未选择头像</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </item>
+   
+   <!-- 登录按钮（原有） -->
    <item>
     <widget class="QPushButton" name="pushButton_login">
      <property name="text">

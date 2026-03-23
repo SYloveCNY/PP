@@ -49,6 +49,10 @@ public:
     void setLoginInfo(int userId, const QString &nickname, QTcpSocket *socket);
     // 登录函数中，填充P2P TCP随机端口
     void sendLoginReq(const QString &nickname);
+    // 设置当前用户头像（显示在label_userInfo）
+    void setSelfAvatar(const QPixmap& pixmap);
+    // 给在线用户列表项添加头像
+    void addUserItemWithAvatar(int userId, const QString& nickname, const QPixmap& avatar);
 
 public slots:
     // 显示聊天消息（仅一个实现）
@@ -109,12 +113,15 @@ private:
     void safeSendFileFragment(FileMsg metaMsg);
     // 新增内网IP判断函数
     bool isPrivateIp(const QHostAddress& addr);
+    // 新增：从sender字符串提取用户ID
+    int parseUserIdFromSender(const QString& sender);
     // 气泡消息工具函数
     void addMessage(const QString& sender, const QString& content, bool isSelf = false);
     // 生成气泡HTML
     QString generateBubbleHtml(const QString& sender, const QString& content, bool isSelf);
     // 辅助函数
-    void saveCompleteImage(int relaySenderId); 
+    void saveCompleteImage(int relaySenderId);
+    QString getUserAvatarPath(int userId);
       
 private:
     // 成员变量
@@ -158,6 +165,13 @@ private:
     int m_holePunchRetryCount = 0;
     static const int MAX_HOLE_PUNCH_RETRIES = 5;
     QTimer* m_imgRecvTimeoutTimer; // 图片接收超时定时器
+    QMap<int, QPixmap> m_userAvatarMap; // 缓存用户ID→头像图片
+    QLabel* m_myAvatarLabel;            // 自己的头像显示标签
+    // 存储当前用户信息
+    int m_selfUserId = -1;
+    QString m_selfNickname;
+    QMap<int, QString> m_avatarBase64Cache;
+
 
     // 打洞用的UDP包（标识用）
     struct HolePunchPacket {

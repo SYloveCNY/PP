@@ -14,8 +14,15 @@
 #include <cerrno> // 新增：用于错误码打印
 #include <chrono> // 新增：心跳时间戳
 #include <fcntl.h>
+#include <fstream>   // 用于ofstream文件操作
+#include <stdexcept> // 用于nlohmann/json的异常捕获
+#include <filesystem>  // 新增：文件系统操作头文件
+#include <openssl/evp.h> // 替换：OpenSSL 3.0 EVP接口
 #include "../../include/protocol.h"
 #include "../../include/json/json.hpp"
+extern "C" {
+#include <openssl/md5.h>
+}
 
 // 全局变量
 std::map<int, UserInfo> g_onlineUsers;
@@ -29,6 +36,11 @@ bool g_isRunning = true;
 int m_udpRelaySocket = -1;                          // UDP中继套接字（原生fd）
 int m_tcpRelayServer = -1;                          // TCP中继服务端套接字
 std::map<int, UserRelayInfo> m_userRelayMap;        // 用户ID -> 中继信息
+// UDP头像相关全局变量
+int g_udpAvatarSocket = -1; // UDP头像监听套接字
+std::map<std::string, AvatarChunkCache> g_avatarChunkCache; // MD5 -> 分片缓存
+std::mutex g_avatarCacheMutex; // 分片缓存锁
+const int AVATAR_CACHE_TIMEOUT_SEC = 300; // 分片缓存超时5分钟
 
 // ==================== 核心广播/线程函数声明 ====================
 // 对外接口（带默认参数，注意：默认参数只能在声明中出现一次）
@@ -84,6 +96,18 @@ void onUdpReadyRead();
 // 服务端新增TCP中继处理
 void onTcpRelayNewConnection();
 
+// 新增：UDP头像处理函数声明
+bool initUdpAvatarServer();
+void handleUdpAvatarPacket();
+void processUdpAvatarChunk(const UDPAvatarHeader& header, const std::vector<char>& chunkData, 
+                          const struct sockaddr_in& clientAddr);
+void processUdpAvatarFinish(const UDPAvatarHeader& header, const struct sockaddr_in& clientAddr);
+std::string calculateFileMd5(const std::string& filePath);
+void cleanExpiredAvatarCache();
+bool mergeAvatarChunks(const std::string& fileMd5, const AvatarChunkCache& cache, int userId);
+bool recvAll(int fd, char* buf, size_t len);
+int getUserIdFromAuth(int clientSocket);
+
 // 检查FD是否有效（核心：判断旧FD是否真的失效）
 bool isFdValid(int fd) {
     int err = 0;
@@ -136,6 +160,66 @@ void cleanZombieUsers() {
                 std::cout << "清理僵尸用户：FD=" << fd << "，UID=" << uid << std::endl;
             }
         }
+    }
+}
+
+// 新增：计算文件MD5
+std::string calculateFileMd5(const std::string& filePath) {
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        return "";
+    }
+
+    // OpenSSL 3.0 EVP接口（无废弃警告）
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        file.close();
+        return "";
+    }
+
+    if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        file.close();
+        return "";
+    }
+
+    char buffer[4096];
+    std::streamsize bytesRead;
+    while ((bytesRead = file.readsome(buffer, sizeof(buffer))) > 0) {
+        EVP_DigestUpdate(ctx, buffer, static_cast<size_t>(bytesRead));
+    }
+
+    unsigned char md5Result[EVP_MAX_MD_SIZE] = {0};
+    unsigned int md5Len = 0;
+    EVP_DigestFinal_ex(ctx, md5Result, &md5Len);
+    EVP_MD_CTX_free(ctx);
+    file.close();
+
+    // 转换为16进制字符串
+    std::ostringstream oss;
+    for (unsigned int i = 0; i < md5Len; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(md5Result[i]);
+    }
+
+    return oss.str();
+}
+
+// 新增：清理过期的头像分片缓存
+void cleanExpiredAvatarCache() {
+    std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+    auto now = std::chrono::steady_clock::now();
+    std::vector<std::string> expiredMd5s;
+    
+    for (const auto& [md5, cache] : g_avatarChunkCache) {
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - cache.createTime);
+        if (duration.count() > AVATAR_CACHE_TIMEOUT_SEC) {
+            expiredMd5s.push_back(md5);
+        }
+    }
+    
+    for (const auto& md5 : expiredMd5s) {
+        g_avatarChunkCache.erase(md5);
+        std::cout << "清理过期头像分片缓存：MD5=" << md5 << std::endl;
     }
 }
 
@@ -242,6 +326,7 @@ std::string serializeUserListRsp(const UserListRsp& rsp) {
         userJson["isOnline"] = user.isOnline;
         userJson["ip"] = user.ip.empty() ? "" : user.ip; // 避免null
         userJson["dataPort"] = user.dataPort <= 0 ? 0 : user.dataPort; // 避免null
+        userJson["avatarUrl"] = user.avatarUrl; // 新增：返回头像URL
         userArray.push_back(userJson);
     }
     j["users"] = userArray;
@@ -356,12 +441,308 @@ bool recvAll(int fd, char* buf, size_t len) {
         ssize_t n = recv(fd, buf + totalRecv, len - totalRecv, 0); // 改为阻塞接收
         if (n < 0) {
             return false;
-        } else if (n == 0) {
-            return false;
         }
         totalRecv += n;
     }
     return true;
+}
+
+// 新增：初始化UDP头像服务器
+bool initUdpAvatarServer() {
+    g_udpAvatarSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udpAvatarSocket < 0) {
+        perror("创建UDP头像套接字失败");
+        return false;
+    }
+
+    int opt = 1;
+    setsockopt(g_udpAvatarSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(g_udpAvatarSocket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); // 新增：允许端口复用
+
+    struct sockaddr_in udpAddr{};
+    udpAddr.sin_family = AF_INET;
+    udpAddr.sin_addr.s_addr = INADDR_ANY;
+    udpAddr.sin_port = htons(8889);
+
+    if (bind(g_udpAvatarSocket, (struct sockaddr*)&udpAddr, sizeof(udpAddr)) < 0) {
+        perror("UDP头像套接字绑定失败");
+        close(g_udpAvatarSocket);
+        g_udpAvatarSocket = -1;
+        return false;
+    }
+
+    // 新增：验证监听是否成功
+    socklen_t len = sizeof(udpAddr);
+    if (getsockname(g_udpAvatarSocket, (struct sockaddr*)&udpAddr, &len) < 0) {
+        perror("获取UDP监听地址失败");
+        close(g_udpAvatarSocket);
+        g_udpAvatarSocket = -1;
+        return false;
+    }
+
+    std::cout << "UDP头像服务器启动，监听端口 " << ntohs(udpAddr.sin_port) << "..." << std::endl;
+    return true;
+}
+
+// 新增：处理UDP头像数据包
+void handleUdpAvatarPacket() {
+    if (g_udpAvatarSocket < 0) return;
+
+    char buffer[8192] = {0}; // 足够容纳头部+1KB分片
+    struct sockaddr_in clientAddr{};
+    socklen_t clientAddrLen = sizeof(clientAddr);
+
+    // 接收UDP数据报
+    ssize_t recvLen = recvfrom(g_udpAvatarSocket, buffer, sizeof(buffer), MSG_DONTWAIT,
+                               (struct sockaddr*)&clientAddr, &clientAddrLen);
+    if (recvLen <= 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("接收UDP头像数据失败");
+        }
+        return;
+    }
+
+    std::cout << "===================== UDP接收触发 =====================" << std::endl;
+    std::cout << "UDP包来源：\"" << inet_ntoa(clientAddr.sin_addr) << "\" : " << ntohs(clientAddr.sin_port) 
+              << "，读取长度：" << recvLen << std::endl;
+
+    // 解析头部
+    if (recvLen < sizeof(UDPAvatarHeader)) {
+        std::cout << "UDP头像数据包过小，忽略：长度=" << recvLen << std::endl;
+        return;
+    }
+
+    UDPAvatarHeader* header = (UDPAvatarHeader*)buffer;
+    // 字节序转换
+    uint32_t msgType = ntohl(header->msgType);
+    uint32_t userId = ntohl(header->userId);
+    uint32_t chunkId = ntohl(header->chunkId);
+    uint32_t totalChunks = ntohl(header->totalChunks);
+    uint32_t chunkSize = ntohl(header->chunkSize);
+    uint32_t totalSize = ntohl(header->totalSize);
+
+    std::cout << "收到UDP头像数据包：msgType=" << msgType 
+              << ", userId=" << userId 
+              << ", chunkId=" << chunkId 
+              << ", totalChunks=" << totalChunks << std::endl;
+
+    // 提取分片数据
+    std::vector<char> chunkData;
+    if (chunkSize > 0 && recvLen > sizeof(UDPAvatarHeader)) {
+        chunkData.assign(buffer + sizeof(UDPAvatarHeader), 
+                        buffer + sizeof(UDPAvatarHeader) + chunkSize);
+    }
+
+    // 处理不同类型的UDP头像包
+    switch (msgType) {
+        case 21: // AVATAR_UDP_CHUNK
+            processUdpAvatarChunk(*header, chunkData, clientAddr);
+            break;
+        case 23: // AVATAR_UDP_FINISH
+            processUdpAvatarFinish(*header, clientAddr);
+            break;
+        default:
+            std::cout << "未知的UDP头像消息类型：" << msgType << std::endl;
+            break;
+    }
+}
+
+// 新增：处理UDP头像分片
+void processUdpAvatarChunk(const UDPAvatarHeader& header, const std::vector<char>& chunkData,
+                          const struct sockaddr_in& clientAddr) {
+    // 字节序转换
+    uint32_t userId = ntohl(header.userId);
+    uint32_t chunkId = ntohl(header.chunkId);
+    uint32_t totalChunks = ntohl(header.totalChunks);
+    uint32_t chunkSize = ntohl(header.chunkSize);
+    uint32_t totalSize = ntohl(header.totalSize);
+    std::string fileMd5(header.fileMd5, 32);
+    std::string fileName(header.fileName);
+
+    std::cout << "处理UDP头像分片：userId=" << userId 
+              << ", chunkId=" << chunkId 
+              << ", md5=" << fileMd5 << std::endl;
+
+    // 验证分片大小
+    if (chunkSize != chunkData.size()) {
+        std::cout << "分片大小不匹配：期望=" << chunkSize << "，实际=" << chunkData.size() << std::endl;
+        return;
+    }
+
+    // 保存分片到缓存
+    {
+        std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+        AvatarChunkCache& cache = g_avatarChunkCache[fileMd5];
+        
+        // 初始化缓存信息（首次收到时）
+        if (cache.chunks.empty()) {
+            cache.fileMd5 = fileMd5;
+            cache.fileName = fileName;
+            cache.totalChunks = totalChunks;
+            cache.totalSize = totalSize;
+            cache.createTime = std::chrono::steady_clock::now();
+        }
+
+        // 保存当前分片
+        cache.chunks[chunkId] = chunkData;
+    }
+
+    // ========== 修复 ACK 发送逻辑 ==========
+    // 1. 从在线用户列表中获取客户端登录时上报的 UDP 端口
+    uint16_t clientBindUdpPort = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto userIt = g_onlineUsers.find(userId);
+        if (userIt != g_onlineUsers.end()) {
+            clientBindUdpPort = userIt->second.udpPort;
+            std::cout << "[ACK发送] 获取到用户" << userId << "绑定的UDP端口：" << clientBindUdpPort << std::endl;
+            
+            // 新增：验证端口有效性（避免无效端口）
+            if (clientBindUdpPort == 0) {
+                std::cout << "[ACK发送] 警告：用户" << userId << "的UDP端口未上报（值为0）" << std::endl;
+            }
+        } else {
+            std::cerr << "[ACK发送] 错误：用户" << userId << "未在线，无法获取绑定的UDP端口" << std::endl;
+            return; // 未在线则无需发送ACK
+        }
+    }
+
+    // 2. 构造 ACK 包（保持原有字节序转换）
+    UDPAckHeader ack{};
+    ack.msgType = htonl(22);        // AVATAR_UDP_ACK：主机序转网络序
+    ack.userId = htonl(userId);     // 用户ID：主机序转网络序
+    ack.chunkId = htonl(chunkId);   // 分片ID：主机序转网络序
+    ack.success = true;             // 布尔值无需字节序转换
+
+    // 3. 构造目标地址：优先使用客户端绑定的 UDP 端口，否则用临时端口
+    struct sockaddr_in targetAddr = clientAddr;
+    if (clientBindUdpPort > 0) {
+        targetAddr.sin_port = htons(clientBindUdpPort); // 端口：主机序转网络序（核心！）
+        std::cout << "[ACK发送] 替换为客户端绑定端口：" << clientBindUdpPort << "（网络序：" << ntohs(targetAddr.sin_port) << "）" << std::endl;
+    } else {
+        std::cout << "[ACK发送] 使用客户端临时端口：" << ntohs(targetAddr.sin_port) << std::endl;
+    }
+
+    // 4. 发送 ACK 并检查错误
+    ssize_t sendResult = sendto(
+        g_udpAvatarSocket, 
+        &ack, 
+        sizeof(UDPAckHeader), 
+        0,
+        (struct sockaddr*)&targetAddr, 
+        sizeof(targetAddr)
+    );
+
+    // 5. 打印详细日志
+    uint16_t targetPortHost = ntohs(targetAddr.sin_port); // 转换为主机序打印
+    if (sendResult == sizeof(UDPAckHeader)) {
+        std::cout << "[ACK发送] 成功 ✅：userId=" << userId 
+                  << ", chunkId=" << chunkId 
+                  << ", 目标IP=" << inet_ntoa(targetAddr.sin_addr)
+                  << ", 目标端口=" << targetPortHost << std::endl;
+    } else {
+        std::cerr << "[ACK发送] 失败 ❌：userId=" << userId 
+                  << ", chunkId=" << chunkId 
+                  << ", 错误码=" << errno 
+                  << ", 错误信息=" << strerror(errno)
+                  << ", 目标端口=" << targetPortHost << std::endl;
+    }
+}
+
+// 新增：合并头像分片
+bool mergeAvatarChunks(const std::string& fileMd5, const AvatarChunkCache& cache, int userId) {
+    // 创建avatars目录
+    std::filesystem::create_directory("./avatars");
+    
+    // 合并文件路径
+    std::string savePath = "./avatars/" + std::to_string(userId) + "_" + cache.fileName;
+    std::ofstream outFile(savePath, std::ios::binary);
+    if (!outFile.is_open()) {
+        std::cout << "创建头像文件失败：" << savePath << std::endl;
+        return false;
+    }
+
+    // 按分片ID顺序写入
+    for (uint32_t i = 0; i < cache.totalChunks; ++i) {
+        auto it = cache.chunks.find(i);
+        if (it == cache.chunks.end()) {
+            std::cout << "缺失分片：" << i << "，合并失败" << std::endl;
+            outFile.close();
+            std::filesystem::remove(savePath);
+            return false;
+        }
+        outFile.write(it->second.data(), it->second.size());
+    }
+
+    outFile.close();
+
+    // 验证文件MD5
+    std::string actualMd5 = calculateFileMd5(savePath);
+    if (actualMd5 != fileMd5) {
+        std::cout << "头像文件MD5校验失败：期望=" << fileMd5 << "，实际=" << actualMd5 << std::endl;
+        std::filesystem::remove(savePath);
+        return false;
+    }
+
+    // 更新用户头像URL
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto userIt = g_onlineUsers.find(userId);
+        if (userIt != g_onlineUsers.end()) {
+            userIt->second.avatarUrl = savePath;
+            std::cout << "用户" << userId << "头像更新成功：" << savePath << std::endl;
+        }
+    }
+
+    return true;
+}
+
+// 新增：处理UDP头像上传完成
+void processUdpAvatarFinish(const UDPAvatarHeader& header, const struct sockaddr_in& clientAddr) {
+    uint32_t userId = ntohl(header.userId);
+    std::string fileMd5(header.fileMd5, 32);
+
+    std::cout << "收到UDP头像上传完成通知：userId=" << userId << ", md5=" << fileMd5 << std::endl;
+
+    // 检查分片完整性
+    AvatarChunkCache cache;
+    {
+        std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+        auto it = g_avatarChunkCache.find(fileMd5);
+        if (it == g_avatarChunkCache.end()) {
+            std::cout << "未找到分片缓存：" << fileMd5 << std::endl;
+            return;
+        }
+        cache = it->second;
+
+        // 检查是否所有分片都已接收
+        if (cache.chunks.size() != cache.totalChunks) {
+            std::cout << "分片不完整：已接收=" << cache.chunks.size() 
+                      << "，期望=" << cache.totalChunks << std::endl;
+            return;
+        }
+    }
+
+    // 合并分片
+    bool mergeSuccess = mergeAvatarChunks(fileMd5, cache, userId);
+    
+    // 发送完成ACK
+    UDPAckHeader ack{};
+    ack.msgType = htonl(22);
+    ack.userId = htonl(userId);
+    ack.chunkId = htonl(0); // 完成包用chunkId=0
+    ack.success = mergeSuccess;
+
+    sendto(g_udpAvatarSocket, &ack, sizeof(UDPAckHeader), 0,
+           (struct sockaddr*)&clientAddr, sizeof(clientAddr));
+
+    // 清理缓存
+    if (mergeSuccess) {
+        std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+        g_avatarChunkCache.erase(fileMd5);
+    }
+
+    std::cout << "UDP头像上传" << (mergeSuccess ? "成功" : "失败") << "：userId=" << userId << std::endl;
 }
 
 // 处理客户端连接
@@ -443,7 +824,40 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             }
         }
 
-        // 锁外广播异常下线通知
+        if (!notifyData.empty()) {
+            broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
+        }
+
+        close(clientFd);
+        return false;
+    } else if (headerLen < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+        std::cout << "客户端FD=" << clientFd << " 异常断开：" << strerror(errno) << std::endl;
+        int offlineUserId = -1;
+        std::string offlineNickname = "";
+        std::string notifyData;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto fdIt = g_fdToUserId.find(clientFd);
+            if (fdIt != g_fdToUserId.end()) {
+                offlineUserId = fdIt->second;
+                auto userIt = g_onlineUsers.find(offlineUserId);
+                if (userIt != g_onlineUsers.end()) {
+                    offlineNickname = userIt->second.nickname;
+                    UserStatusNotify notify;
+                    notify.userId = offlineUserId;
+                    notify.nickname = offlineNickname;
+                    notify.isOnline = false;
+                    notifyData = nlohmann::json(notify).dump();
+                    g_onlineUsers.erase(userIt);
+                }
+                g_fdToUserId.erase(fdIt);
+                g_fdLastHeartbeat.erase(clientFd);
+            }
+        }
+
         if (!notifyData.empty()) {
             broadcast(notifyData, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), clientFd);
         }
@@ -482,6 +896,9 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             nlohmann::json j = nlohmann::json::parse(jsonData);
             LoginReq req;
             req.nickname = j["nickname"];
+
+            // 新增：解析头像URL
+            std::string avatarUrl = j.contains("avatarUrl") ? j["avatarUrl"].get<std::string>() : "";
             
             // 提取客户端携带的端口（补充：udpPort解析，初始值改为0更合理）
             std::string clientIpStr = clientIp;
@@ -515,8 +932,9 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                     newUser.userId = newUserId;
                     newUser.isOnline = true;
                     newUser.ip = clientIpStr;       
-                    newUser.dataPort = clientDataPort; // 原有：填充TCP端口
-                    newUser.udpPort = clientUdpPort;   // 新增：填充真实UDP端口（关键修改）
+                    newUser.dataPort = clientDataPort; // 填充TCP端口
+                    newUser.udpPort = clientUdpPort;   // 填充真实UDP端口（关键修改）
+                    newUser.avatarUrl = avatarUrl;     // 赋值头像URL
                     g_onlineUsers[newUserId] = newUser;
                     g_fdToUserId[clientFd] = newUserId;
                     // 初始化心跳时间
@@ -578,11 +996,13 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             // 新增：解析心跳包中携带的最新P2P端口（dataBufferStr是心跳包的data体）
             uint16_t newDataPort = 0;
             uint16_t newUdpPort = 0;
+            std::string newAvatarUrl = "";
             if (!dataBufferStr.empty()) { // 心跳包有数据（携带端口）
                 try {
                     nlohmann::json j = nlohmann::json::parse(dataBufferStr);
                     newDataPort = j.contains("dataPort") ? j["dataPort"].get<uint16_t>() : 0;
                     newUdpPort = j.contains("udpPort") ? j["udpPort"].get<uint16_t>() : 0;
+                    newAvatarUrl = j.contains("avatarUrl") ? j["avatarUrl"].get<std::string>() : "";
                 } catch (...) {
                     std::cout << "心跳包端口解析失败，忽略" << std::endl;
                 }
@@ -600,12 +1020,14 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         int userId = fdIt->second;
                         auto userIt = g_onlineUsers.find(userId);
                         if (userIt != g_onlineUsers.end()) {
-                            // 替换旧端口为心跳包中的最新端口
-                            userIt->second.dataPort = newDataPort;
-                            userIt->second.udpPort = newUdpPort;
-                            std::cout << "更新用户端口：UID=" << userId 
-                                    << "，旧端口=" << userIt->second.dataPort 
-                                    << "→新端口=" << newDataPort << std::endl;
+                            if (newDataPort > 0) {
+                                userIt->second.dataPort = newDataPort;
+                                userIt->second.udpPort = newUdpPort;
+                            }
+                            if (!newAvatarUrl.empty()) { // 仅当有新头像URL时更新
+                                userIt->second.avatarUrl = newAvatarUrl;
+                                std::cout << "更新用户" << userId << "的头像URL：" << newAvatarUrl << std::endl;
+                            }
                         }
                     }
                 }
@@ -731,7 +1153,6 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             }
             break;
         }
-        // 新增：处理图片消息
         case MsgType::IMAGE_MSG: {
             std::cout << "收到图片消息（MsgType::IMAGE_MSG），dataLen=" << dataLen << std::endl;
             ImageMsg imgMsg = deserializeImageMsg(dataBufferStr);
@@ -757,14 +1178,6 @@ bool handleClient(int clientFd, const std::string& clientIp) {
                         receiverIp = userIt->second.ip.empty() ? "127.0.0.1" : userIt->second.ip; // 兜底本地IP
                         receiverTcpPort = userIt->second.dataPort;
                         receiverUdpPort = userIt->second.udpPort;
-                        
-                        // 端口兜底：若接收方端口无效，使用默认值（仅调试）
-                        if (receiverTcpPort == 0) {
-                            std::cout << "警告：接收方" << imgMsg.receiverId << "TCP端口无效，使用默认值" << std::endl;
-                        }
-                        if (receiverUdpPort == 0) {
-                            std::cout << "警告：接收方" << imgMsg.receiverId << "UDP端口无效，使用默认值" << std::endl;
-                        }
                     }
                 }
                 
@@ -818,8 +1231,6 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             send(clientFd, rspData.c_str(), rspData.size(), MSG_NOSIGNAL);
             break;
         }
-
-        // 新增：处理文件消息（逻辑与图片一致，仅结构体不同）
         case MsgType::FILE_MSG: {
             std::cout << "收到文件消息（MsgType::FILE_MSG），dataLen=" << dataLen << std::endl;
             FileMsg fileMsg = deserializeFileMsg(dataBufferStr);
@@ -895,14 +1306,10 @@ bool handleClient(int clientFd, const std::string& clientIp) {
             send(clientFd, rspData.c_str(), rspData.size(), MSG_NOSIGNAL);
             break;
         }
-
-        // 新增：处理点对点地址通知（透传，无需额外逻辑）
         case MsgType::P2P_ADDR_NOTIFY: {
             std::cout << "转发点对点地址通知（MsgType::P2P_ADDR_NOTIFY）" << std::endl;
             break;
         }
-
-        // 新增：处理客户端主动下线请求（LOGOUT_REQ）
         case MsgType::LOGOUT_REQ: {
             std::cout << "收到客户端主动下线通知（FD=" << clientFd << "）" << std::endl;
             
@@ -1103,11 +1510,19 @@ int main() {
         return -1;
     }
 
+    // 初始化UDP头像服务器
+    if (!initUdpAvatarServer()) {
+        std::cerr << "UDP头像服务器初始化失败" << std::endl;
+        close(serverFd);
+        return -1;
+    }
+
     // ========== epoll初始化 ==========
     int epollFd = epoll_create1(0);
     if (epollFd < 0) {
         perror("epoll_create失败");
         close(serverFd);
+        if (g_udpAvatarSocket >= 0) close(g_udpAvatarSocket);
         return -1;
     }
 
@@ -1117,6 +1532,18 @@ int main() {
     if (epoll_ctl(epollFd, EPOLL_CTL_ADD, serverFd, &ev) < 0) {
         perror("epoll_ctl add serverFd失败");
         close(serverFd);
+        if (g_udpAvatarSocket >= 0) close(g_udpAvatarSocket);
+        close(epollFd);
+        return -1;
+    }
+
+    // 添加UDP头像FD到epoll
+    ev.events = EPOLLIN;
+    ev.data.fd = g_udpAvatarSocket;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, g_udpAvatarSocket, &ev) < 0) {
+        perror("epoll_ctl add udpAvatarSocket失败");
+        close(serverFd);
+        close(g_udpAvatarSocket);
         close(epollFd);
         return -1;
     }
@@ -1178,6 +1605,10 @@ int main() {
                         g_fdLastHeartbeat[clientFd] = std::chrono::steady_clock::now();
                     }
                 }
+            }
+            // UDP头像FD：有数据可读
+            else if (fd == g_udpAvatarSocket) {
+                handleUdpAvatarPacket();
             } 
             // 客户端断开连接
             else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
@@ -1229,6 +1660,7 @@ int main() {
         g_heartbeatCheckThread.join();
     }
     close(serverFd);
+    if (g_udpAvatarSocket >= 0) close(g_udpAvatarSocket);
     close(epollFd);
     return 0;
 }

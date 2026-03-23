@@ -44,12 +44,16 @@ enum class MsgType : uint32_t {
     PRIVATE_MSG_RSP = 11,   // 私聊响应
     LOGOUT_REQ = 12,        // 主动下线请求
     HEARTBEAT_RESP = 13,    // 心跳响应
-    STATUS_BROADCAST = 14,  // 状态广播（上线/下线通知）
+    STATUS_BROADCAST = 14,  // 状态广播（上线/下线通知）    
     IMAGE_MSG = 15,         // 图片消息（请求）
     IMAGE_MSG_RSP = 16,     // 图片消息响应
     FILE_MSG = 17,          // 文件消息（请求）
     FILE_MSG_RSP = 18,      // 文件消息响应
-    P2P_ADDR_NOTIFY = 19    // 点对点地址通知（服务端转发对方IP/Port）
+    P2P_ADDR_NOTIFY = 19,   // 点对点地址通知（服务端转发对方IP/Port）
+    AVATAR_UDP_CHUNK = 21,
+    AVATAR_UDP_ACK = 22,
+    AVATAR_UDP_FINISH = 23
+
 };
 
 // 用户信息结构体（包含ip和dataPort）
@@ -59,7 +63,9 @@ struct UserInfo {
     bool isOnline;          
     std::string ip;         
     int dataPort = 0; 
-    int udpPort = 0;      
+    int udpPort = 0; 
+    std::string avatarUrl;
+    std::string avatarPath;     
 };
 
 // 登录请求/响应
@@ -73,6 +79,54 @@ struct LoginRsp {
     bool success;           
     std::string msg;
     int userId;             
+};
+
+// 头像上传/响应
+struct AvatarUpload {
+    int userId = 0;              // 上传用户ID
+    std::string fileName;        // 头像文件名
+    uint64_t fileSize = 0;       // 头像大小（字节）
+    std::string base64Data;      // Base64编码的头像数据
+    std::string fileMd5;         // 头像MD5（校验完整性）
+};
+
+struct AvatarRsp {
+    bool success = false;        // 上传是否成功
+    std::string msg;             // 提示信息
+    int userId = 0;              // 上传用户ID
+    std::string avatarUrl;       // 头像存储路径/URL（服务端返回）
+};
+
+// UDP头像分片头部
+struct UDPAvatarHeader {
+    uint32_t msgType;          // 消息类型（AVATAR_UDP_CHUNK = 21）
+    uint32_t userId;           // 用户ID
+    uint32_t chunkId;          // 当前分片ID（从0开始）
+    uint32_t totalChunks;      // 总分片数
+    uint32_t chunkSize;        // 当前分片大小
+    uint32_t totalSize;        // 文件总大小
+    char fileMd5[33];          // 文件MD5（32位）
+    char fileName[64];         // 文件名
+};
+
+// UDP确认包
+#pragma pack(push, 1) // 强制1字节对齐
+struct UDPAckHeader {
+    uint32_t msgType;
+    uint32_t userId;
+    uint32_t chunkId;
+    bool success;
+};
+#pragma pack(pop) // 恢复默认对齐
+
+// 分片缓存结构体
+struct AvatarChunkCache {
+    std::string fileMd5;
+    std::string fileName;
+    uint32_t totalChunks;
+    uint32_t totalSize;
+    std::map<uint32_t, std::vector<char>> chunks; // chunkId -> 数据
+    std::chrono::steady_clock::time_point createTime; // 超时清理用
 };
 
 // 用户列表响应
@@ -172,7 +226,8 @@ template <> struct adl_serializer<UserInfo> {
             {"isOnline", u.isOnline},
             {"ip", u.ip}, 
             {"dataPort", u.dataPort},
-            {"udpPort", u.udpPort} // 新增UDP端口序列化
+            {"udpPort", u.udpPort},
+            {"avatarUrl", u.avatarUrl}
         };
     }
     static void from_json(const json& j, UserInfo& u) {
@@ -182,6 +237,7 @@ template <> struct adl_serializer<UserInfo> {
         u.ip = j.contains("ip") ? j["ip"].get<std::string>() : "";
         u.dataPort = j.contains("dataPort") ? j["dataPort"].get<int>() : 0;
         u.udpPort = j.contains("udpPort") ? j["udpPort"].get<int>() : 0;
+        u.avatarUrl = j.contains("avatarUrl") ? j["avatarUrl"].get<std::string>() : "";
     }
 };
 
@@ -214,6 +270,42 @@ template <> struct adl_serializer<LoginRsp> {
         rsp.success = j.contains("success") ? j["success"].get<bool>() : false;
         rsp.msg = j.contains("msg") ? j["msg"].get<std::string>() : "";
         rsp.userId = j.contains("userId") ? j["userId"].get<int>() : -1;
+    }
+};
+
+template <> struct adl_serializer<AvatarUpload> {
+    static void to_json(json& j, const AvatarUpload& upload) {
+        j = json{
+            {"userId", upload.userId},
+            {"fileName", upload.fileName},
+            {"fileSize", upload.fileSize},
+            {"base64Data", upload.base64Data},
+            {"fileMd5", upload.fileMd5}
+        };
+    }
+    static void from_json(const json& j, AvatarUpload& upload) {
+        upload.userId = j.contains("userId") ? j["userId"].get<int>() : 0;
+        upload.fileName = j.contains("fileName") ? j["fileName"].get<std::string>() : "";
+        upload.fileSize = j.contains("fileSize") ? j["fileSize"].get<uint64_t>() : 0;
+        upload.base64Data = j.contains("base64Data") ? j["base64Data"].get<std::string>() : "";
+        upload.fileMd5 = j.contains("fileMd5") ? j["fileMd5"].get<std::string>() : "";
+    }
+};
+
+template <> struct adl_serializer<AvatarRsp> {
+    static void to_json(json& j, const AvatarRsp& rsp) {
+        j = json{
+            {"success", rsp.success},
+            {"msg", rsp.msg},
+            {"userId", rsp.userId},
+            {"avatarUrl", rsp.avatarUrl}
+        };
+    }
+    static void from_json(const json& j, AvatarRsp& rsp) {
+        rsp.success = j.contains("success") ? j["success"].get<bool>() : false;
+        rsp.msg = j.contains("msg") ? j["msg"].get<std::string>() : "";
+        rsp.userId = j.contains("userId") ? j["userId"].get<int>() : 0;
+        rsp.avatarUrl = j.contains("avatarUrl") ? j["avatarUrl"].get<std::string>() : "";
     }
 };
 
@@ -458,6 +550,23 @@ inline std::string serializeP2PAddrNotify(const P2PAddrNotify& notify) {
 
 inline std::string serializeImageMsgRsp(const ImageMsgRsp& rsp) {
     return serialize<ImageMsgRsp>(rsp);
+}
+
+// ========== 补充Avatar相关的序列化/反序列化封装函数 ==========
+inline AvatarUpload deserializeAvatarUpload(const std::string& jsonStr) {
+    return deserialize<AvatarUpload>(jsonStr);
+}
+
+inline AvatarRsp deserializeAvatarRsp(const std::string& jsonStr) {
+    return deserialize<AvatarRsp>(jsonStr);
+}
+
+inline std::string serializeAvatarUpload(const AvatarUpload& upload) {
+    return serialize<AvatarUpload>(upload);
+}
+
+inline std::string serializeAvatarRsp(const AvatarRsp& rsp) {
+    return serialize<AvatarRsp>(rsp);
 }
 
 // Qt客户端sendPacket函数声明

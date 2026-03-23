@@ -1,3 +1,5 @@
+#define AVATAR_DIR "./avatars/" 
+
 #include "ChatWindow.h"
 #include "ui_ChatWindow.h" 
 #include <QVBoxLayout>
@@ -25,6 +27,10 @@
 #include <QTcpServer>   // 补充：TCP Server
 #include <QTcpSocket>   // 补充：TCP Socket
 #include <QAbstractSocket> // 补充：Socket错误处理
+#include <QFileIconProvider>   // 对应QFileIconProvider
+#include <QDesktopServices>    // 对应QDesktopServices
+#include <QUrl>                // 对应QUrl
+#include <QFile>               // 对应QFile
 #include <iostream>
 #include "../../include/protocol.h"
 #include "../../include/protocol_qt.h"
@@ -253,40 +259,28 @@ void ChatWindow::sendLoginReq(const QString& nickname) {
 
 // 新增：主动关闭窗口时发送下线通知
 void ChatWindow::closeEvent(QCloseEvent *event) {
-    if (m_socket && m_socket->state() == QTcpSocket::ConnectedState) {
-        // 停止心跳定时器，避免干扰
-        m_heartbeatTimer->stop();
-        // 禁用Socket的延迟发送，强制立即发送
-        m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+    if (m_socket) { // 先检查非空
+        if (m_socket->state() == QTcpSocket::ConnectedState) {
+            m_heartbeatTimer->stop();
+            m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
-        // 构造主动下线通知
-        UserStatusNotify notify;
-        notify.userId = m_userId;
-        notify.nickname = m_nickname.toStdString();
-        notify.isOnline = false;
-        std::string notifyData = serialize(notify);
-        
-        // 发送主动下线消息（强制发送）
-        bool sendOk = sendPacket(m_socket, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), notifyData, nextMsgId++, m_userId);
-        if (sendOk) {
+            // 构造下线通知
+            UserStatusNotify notify;
+            notify.userId = m_userId;
+            notify.nickname = m_nickname.toStdString();
+            notify.isOnline = false;
+            std::string notifyData = serialize(notify);
+            
+            sendPacket(m_socket, static_cast<uint32_t>(MsgType::USER_STATUS_NOTIFY), notifyData, nextMsgId++, m_userId);
             m_socket->waitForBytesWritten(1000);
-        }
-        
-        // 断开连接
-        m_socket->disconnectFromHost();
-        if (m_socket->state() != QTcpSocket::UnconnectedState) {
+            m_socket->disconnectFromHost();
             m_socket->waitForDisconnected(1000);
         }
-
-        // 清理全局变量
-        g_currentUserId = 0;
-        g_clientSocket = nullptr;
+        m_socket = nullptr;
     }
 
-    // 重置成员变量
-    m_userId = 0;
-    m_nickname.clear();
-    m_socket = nullptr;
+    g_currentUserId = 0;
+    g_clientSocket = nullptr;
     event->accept();
 }
 
@@ -298,10 +292,17 @@ void ChatWindow::setLoginInfo(int userId, const QString& nickname, QTcpSocket* s
     g_clientSocket = socket;
     g_currentUserId = userId;
 
-    // 关键：打印本地监听端口，确认和登录时传递的一致
+    // 1. 先获取头像路径
+    QString avatarPath = getUserAvatarPath(userId);
+    QPixmap avatarPixmap(avatarPath);
+    
+    // 2. 调用setSelfAvatar显示头像+文字（不再单独设置pixmap）
+    setSelfAvatar(avatarPixmap);
+
+    // 3. 显示P2P端口信息
     m_userInfoLabel->setText(QString("当前用户：%1（ID：%2，P2P监听端口：%3）")
                              .arg(nickname).arg(userId).arg(m_p2pTcpPort));
-    showMessage("系统提示", QString("登录成功！本地P2P监听端口：%1，请确认服务端存储的是该端口").arg(m_p2pTcpPort));
+    showMessage("系统提示", QString("登录成功！本地P2P监听端口：%1").arg(m_p2pTcpPort));
 
     connect(m_socket, &QTcpSocket::readyRead, this, &ChatWindow::onServerReadyRead);
 }
@@ -533,33 +534,33 @@ void ChatWindow::onServerReadyRead() {
 
 // 更新用户列表（简化实现）
 void ChatWindow::updateUserList(const std::vector<UserInfo>& users) {
-    // 清空列表前先确认控件有效
     if (!ui->listWidget_onlineUsers) {
         showMessage("系统提示", "在线用户列表控件未初始化！");
         return;
     }
     ui->listWidget_onlineUsers->clear();
     
-    // 遍历添加用户到列表
     for (const auto& user : users) {
-        QString ipStr = user.ip.empty() ? "未知" : QString::fromStdString(user.ip);
-        QString portStr = (user.dataPort <= 0) ? "无" : QString::number(user.dataPort);
-        
-        // 缓存用户ID和端口
-        if (user.userId > 0) {
-            m_userPortMap[user.userId] = portStr;
+        // 1. 获取用户头像
+        QString avatarPath = getUserAvatarPath(user.userId);
+        QPixmap avatarPixmap(avatarPath);
+        if (avatarPixmap.isNull()) {
+            avatarPixmap.load("qrc:/images/default_avatar.png");
         }
         
-        QString itemText = QString("%1（ID：%2，IP：%3，端口：%4）")
-            .arg(QString::fromStdString(user.nickname))
-            .arg(user.userId)
-            .arg(ipStr)
-            .arg(portStr);
+        // 2. 调用addUserItemWithAvatar添加带头像的项
+        addUserItemWithAvatar(
+            user.userId, 
+            QString::fromStdString(user.nickname), 
+            avatarPixmap
+        );
         
-        ui->listWidget_onlineUsers->addItem(itemText);
+        // 3. 缓存用户端口
+        if (user.userId > 0) {
+            m_userPortMap[user.userId] = QString::number(user.dataPort);
+        }
     }
     
-    // 聊天框提示更新结果
     showMessage("系统提示", QString("在线用户列表已更新，当前在线%1人").arg(users.size()));
 }
 
@@ -1591,17 +1592,32 @@ void ChatWindow::getOnlineUserList() {
         return;
     }
 
-    // 发送USER_LIST_REQ（msgType=3），无数据体
+    if (m_userId <= 0) {
+        showMessage("系统提示", "用户未登录，无法获取在线用户！");
+        return;
+    }
+
+    // 清空之前的用户列表缓存
+    m_userPortMap.clear();
+    
+    // 发送用户列表请求（确保数据为空字符串）
     bool ret = sendPacket(
         m_socket, 
         static_cast<uint32_t>(MsgType::USER_LIST_REQ), 
-        "",  // 无数据体
+        "",  // 明确的空数据
         nextMsgId++, 
         m_userId
     );
 
     if (ret) {
         showMessage("系统提示", "已发送在线用户列表请求，请等待响应...");
+        // 增加超时处理
+        QTimer::singleShot(5000, this, [=]() {
+            if (ui->listWidget_onlineUsers->count() == 0) {
+                showMessage("系统提示", "获取用户列表超时，尝试重新获取...");
+                getOnlineUserList(); // 重试一次
+            }
+        });
     } else {
         showMessage("系统提示", "发送在线用户列表请求失败！");
     }
@@ -1926,18 +1942,67 @@ QString ChatWindow::generateBubbleHtml(const QString& sender, const QString& con
       .arg(QTime::currentTime().toString("HH:mm")); // 追加消息时间
 }
 
+// 新增：从sender字符串提取用户ID
+int ChatWindow::parseUserIdFromSender(const QString& sender) {
+    // 匹配规则：从sender中提取数字ID（支持"用户123"、"123-昵称"、"昵称(ID:123)"等格式）
+    QRegularExpression re(R"(\d+)"); // 匹配所有数字
+    QRegularExpressionMatch match = re.match(sender);
+    if (match.hasMatch()) {
+        return match.captured().toInt();
+    }
+    return -1; // 无ID返回-1
+}
+
 // 添加消息到聊天框
 void ChatWindow::addMessage(const QString& sender, const QString& content, bool isSelf) {
-    // 禁用滚动条自动跳转（避免插入HTML时滚动条乱跑）
+    // 1. 定义气泡样式（保留原有样式，优化命名）
+    QString bubbleStyle = isSelf 
+        ? R"(style='background:#07C160; color:white; border-radius:18px 18px 0 18px; padding:10px 15px; margin:5px 0; max-width:70%; box-shadow: 0 1px 2px rgba(0,0,0,0.1);')"
+        : R"(style='background:white; color:#333; border-radius:18px 18px 18px 0; padding:10px 15px; margin:5px 0; max-width:70%; box-shadow: 0 1px 2px rgba(0,0,0,0.1);')";
+
+    // 2. 复用封装好的函数获取头像路径（避免重复代码，保证路径正确）
+    QString avatarPath = "qrc:/images/default_avatar.png";
+    if (!isSelf) {
+        int senderId = parseUserIdFromSender(sender);
+        if (senderId > 0) {
+            avatarPath = getUserAvatarPath(senderId); // 复用之前的函数，避免重复逻辑
+        }
+    } else {
+        avatarPath = getUserAvatarPath(m_userId);
+    }
+
+    // 3. 禁用滚动条自动跳转（避免插入HTML时滚动条乱跑）
     QScrollBar* scrollBar = ui->textEdit_chatLog->verticalScrollBar();
     bool isAtBottom = (scrollBar->value() == scrollBar->maximum());
 
-    // 追加气泡HTML
-    ui->textEdit_chatLog->append(generateBubbleHtml(sender, content, isSelf));
+    // 4. 构建完整的带头像+消息内容的HTML（核心修复：补全内容，修正布局）
+    QString bubbleHtml = QString(R"(
+        <div style='width:100%; overflow:hidden; margin:8px 0;'>
+            <!-- 头像：左/右浮动 -->
+            <img src='%1' style='width:30px; height:30px; border-radius:15px; %2; margin:0 5px;'/>
+            <!-- 消息气泡：对应浮动，包裹实际内容 -->
+            <div %3 style='%4'>
+                <div style='word-wrap: break-word;'>%5</div>
+                <div style='font-size:10px; color:#999; margin-top:4px; text-align:right;'>%6</div>
+            </div>
+        </div>
+    )").arg(
+        avatarPath,                                    // %1: 头像路径
+        isSelf ? "float:right;" : "float:left;",       // %2: 头像浮动方向
+        isSelf ? "float:right;" : "float:left;",       // %3: 气泡浮动方向
+        bubbleStyle,                                   // %4: 气泡样式
+        content.toHtmlEscaped(),                       // %5: 消息内容（转义HTML，避免XSS/格式错乱）
+        QDateTime::currentDateTime().toString("HH:mm") // %6: 发送时间
+    );
 
-    // 如果原本在底部，就自动滚动到底部
+    // 5. 只追加一次完整的HTML（修复重复追加问题）
+    ui->textEdit_chatLog->append(bubbleHtml);
+
+    // 6. 如果原本在底部，自动滚动到底部
     if (isAtBottom) {
-        scrollBar->setValue(scrollBar->maximum());
+        QTimer::singleShot(0, scrollBar, [scrollBar]() {
+            scrollBar->setValue(scrollBar->maximum());
+        });
     }
 }
 
@@ -1968,4 +2033,108 @@ void ChatWindow::saveCompleteImage(int relaySenderId) {
     // 重置缓存
     m_pendingImageMsg = ImageMsg();
     m_pendingImageData.clear();
+}
+
+QString ChatWindow::getUserAvatarPath(int userId) {
+    // 1. 优先查缓存，避免重复编码
+    if (m_avatarBase64Cache.contains(userId)) {
+        return m_avatarBase64Cache[userId];
+    }
+
+    // 2. 原有逻辑（拼路径、加载图片、转Base64）
+    QString avatarDir = QCoreApplication::applicationDirPath() + "/avatars/";
+    QDir dir(avatarDir);
+    if (!dir.exists()) dir.mkpath(avatarDir);
+
+    QStringList filters;
+    filters << QString("%1.png").arg(userId) 
+            << QString("%1.jpg").arg(userId) 
+            << QString("%1.jpeg").arg(userId);
+    
+    QStringList avatarFiles = dir.entryList(filters, QDir::Files);
+    QString avatarFilePath;
+    if (!avatarFiles.isEmpty()) {
+        avatarFilePath = avatarDir + avatarFiles.first();
+    }
+
+    QPixmap avatarPixmap;
+    QString base64Str;
+    if (!avatarFilePath.isEmpty() && avatarPixmap.load(avatarFilePath)) {
+        avatarPixmap = avatarPixmap.scaled(30, 30, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QByteArray ba;
+        QBuffer buffer(&ba);
+        buffer.open(QIODevice::WriteOnly);
+        avatarPixmap.save(&buffer, "PNG"); 
+        base64Str = QString("data:image/png;base64,%1").arg(QString(ba.toBase64()));
+    } else if (avatarPixmap.load(":/images/default_avatar.png")) {
+        avatarPixmap = avatarPixmap.scaled(30, 30, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QByteArray ba;
+        QBuffer buffer(&ba);
+        buffer.open(QIODevice::WriteOnly);
+        avatarPixmap.save(&buffer, "PNG");
+        base64Str = QString("data:image/png;base64,%1").arg(QString(ba.toBase64()));
+    }
+
+    // 3. 缓存结果（仅缓存有效字符串）
+    if (!base64Str.isEmpty()) {
+        m_avatarBase64Cache[userId] = base64Str;
+    }
+
+    return base64Str;
+}
+
+// 设置当前用户头像（显示在label_userInfo，图文结合）
+void ChatWindow::setSelfAvatar(const QPixmap& pixmap) {
+    if (!ui || !ui->label_userInfo) return;
+    
+    // 调整标签为水平布局：头像 + 文字
+    QHBoxLayout* layout = new QHBoxLayout(ui->label_userInfo);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(5);
+    
+    // 头像Label（大小64x64）
+    QLabel* avatarLabel = new QLabel(ui->label_userInfo);
+    avatarLabel->setFixedSize(64, 64);
+    avatarLabel->setPixmap(pixmap.scaled(64, 64, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    avatarLabel->setScaledContents(true);
+    layout->addWidget(avatarLabel);
+    
+    // 文字Label（显示用户信息）
+    QLabel* textLabel = new QLabel(ui->label_userInfo);
+    textLabel->setText(QString("当前用户：%1（ID：%2）").arg(m_selfNickname).arg(m_selfUserId));
+    layout->addWidget(textLabel);
+    
+    ui->label_userInfo->setLayout(layout);
+    qDebug() << "[ChatWindow] 当前用户头像已显示在label_userInfo";
+}
+
+// 给在线用户列表项添加头像（自定义列表项）
+void ChatWindow::addUserItemWithAvatar(int userId, const QString& nickname, const QPixmap& avatar) {
+    if (!ui || !ui->listWidget_onlineUsers) return;
+    
+    // 创建自定义列表项
+    QListWidgetItem* item = new QListWidgetItem(ui->listWidget_onlineUsers);
+    item->setSizeHint(QSize(0, 50)); // 设置项高度
+    
+    // 项的布局：头像 + 用户名
+    QWidget* itemWidget = new QWidget;
+    QHBoxLayout* itemLayout = new QHBoxLayout(itemWidget);
+    itemLayout->setContentsMargins(5, 5, 5, 5);
+    itemLayout->setSpacing(10);
+    
+    // 头像Label（48x48）
+    QLabel* avatarLabel = new QLabel(itemWidget);
+    avatarLabel->setFixedSize(48, 48);
+    avatarLabel->setPixmap(avatar.scaled(48, 48, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    avatarLabel->setScaledContents(true);
+    itemLayout->addWidget(avatarLabel);
+    
+    // 用户名Label
+    QLabel* nameLabel = new QLabel(itemWidget);
+    nameLabel->setText(QString("用户%1：%2").arg(userId).arg(nickname.isEmpty() ? "未命名" : nickname));
+    itemLayout->addWidget(nameLabel);
+    
+    ui->listWidget_onlineUsers->addItem(item);
+    ui->listWidget_onlineUsers->setItemWidget(item, itemWidget);
+    qDebug() << "[ChatWindow] 在线用户" << userId << "头像已添加到列表";
 }
